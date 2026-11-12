@@ -341,18 +341,56 @@ class Caster extends EventEmitter {
       this._log('info', `各线路返回：${desc}`);
     }
 
+    // 拉一次诊断：分清「视频没有这一档」和「账号权限没被承认」
+    let diag = null;
+    try {
+      diag = await bili.diagnose(
+        {
+          aid: this.video && this.video.aid,
+          bvid: this.video && this.video.bvid,
+          cid: this.video && this.video.cid,
+          epId: (this.video && (this.video.epid || this.video.epId)) || 0,
+          cookie: this.accessCookie,
+        },
+        want
+      );
+    } catch (_) {
+      /* 诊断失败不影响提示 */
+    }
+
+    if (diag) {
+      const loginText =
+        diag.login.isLogin === true
+          ? `已登录${diag.login.uname ? `（${diag.login.uname}）` : ''}`
+          : diag.login.isLogin === false
+            ? '未登录'
+            : '无法确认';
+      this._log(
+        'info',
+        `诊断：登录=${loginText}｜接口允许=${diag.accept.join(',') || '未知'}｜视频编码=${
+          diag.encoded.join(',') || '未知'
+        }${diag.err ? `｜${diag.err}` : ''}`
+      );
+    }
+
     if (want >= 112) return `${wantLabel} 需要大会员，已用 ${gotLabel}`;
     if (want >= 80) {
       if (!this.accessCookie) {
         return `${wantLabel} 需要先在浏览器登录 B 站，已用 ${gotLabel}`;
       }
-      // 有 cookie 却没拿到 1080P：先校验登录态，别冤枉用户的账号
-      const login = await bili.checkLogin(this.accessCookie);
-      if (login.isLogin === false) {
+      if (diag && diag.login.isLogin === false) {
         return 'B 站登录已失效，请在浏览器退出并重新登录 B 站，再点一次投屏';
       }
-      if (login.isLogin && login.vip) {
-        return `${wantLabel} 该视频不可用（大会员线路未生效），已用 ${gotLabel}`;
+      // 登录后能拿到的分轨里没有这一档 → 账号/版权层面就不给
+      if (diag && diag.login.isLogin && diag.encoded.length && !diag.encoded.includes(want)) {
+        return `${wantLabel} 该视频在此账号下不提供（1080P 多为大会员/版权限制），已用 ${gotLabel}`;
+      }
+      // 分轨里有 1080P，但合并流只给到 720P
+      if (diag && diag.login.isLogin && diag.encoded.includes(want)) {
+        return `${wantLabel} 接口只下发了 ${gotLabel}（合并流受限），可稍后重试`;
+      }
+      if (diag && diag.login.isLogin && diag.login.vip) {
+        return `${wantLabel} 大会员线路未生效（可能需重新登录），已用 ${gotLabel}`;
       }
       return `${wantLabel} 该视频或账号不可用（部分视频需大会员），已用 ${gotLabel}`;
     }

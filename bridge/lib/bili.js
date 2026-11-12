@@ -593,6 +593,58 @@ async function checkLogin(cookie) {
   return info;
 }
 
+/** 拉一次 DASH 信息（不用于播放，只用于诊断）：
+ *  accept = 接口按「账号权限」允许的清晰度；encoded = 视频实际编码的清晰度。
+ *  两者一对比就知道到底是「视频没有 1080P」还是「账号/登录没被承认」。 */
+async function fetchDashInfo(input, qn = 80) {
+  const cid = Number(input.cid) || 0;
+  if (!cid) throw new Error('缺少 cid');
+  const q = {
+    cid: String(cid),
+    qn: String(qn),
+    fnval: '16',
+    fnver: '0',
+    fourk: '1',
+    platform: 'pc',
+  };
+  if (input.epId) q.ep_id = String(input.epId);
+  if (input.bvid) q.bvid = String(input.bvid);
+  else if (input.aid) q.avid = String(input.aid);
+
+  const keys = await getWbiKeys();
+  const json = await getJson(
+    `https://api.bilibili.com/x/player/wbi/playurl?${wbiSign(q, wbiMixinKey(keys))}`,
+    { headers: cookieHeaders(input.cookie) }
+  );
+  if (json.code !== 0 || !json.data) throw new Error(json.message || `code ${json.code}`);
+  const d = json.data;
+  const encoded = [];
+  for (const v of (d.dash && d.dash.video) || []) {
+    const id = Number(v.id);
+    if (id && !encoded.includes(id)) encoded.push(id);
+  }
+  encoded.sort((a, b) => b - a);
+  return { accept: normalizeAccept(d), encoded, quality: Number(d.quality) || 0 };
+}
+
+/**
+ * 清晰度诊断：一次把「登录态 + 接口允许 + 视频实际编码」都查清。
+ * 只在没拿到目标清晰度时调用，不参与正常播放。
+ */
+async function diagnose(input, want = 0) {
+  const out = { login: { isLogin: null, uname: '', vip: 0 }, accept: [], encoded: [], mp4: 0, err: '' };
+  out.login = await checkLogin(input.cookie);
+  try {
+    const d = await fetchDashInfo(input, want >= 80 ? want : 80);
+    out.accept = d.accept.map((x) => x.qn);
+    out.encoded = d.encoded;
+    out.mp4 = d.quality;
+  } catch (err) {
+    out.err = err.message;
+  }
+  return out;
+}
+
 async function fetchPlayUrlViaHtml5(input, cid, qn) {
   const q = buildStreamQuery(input, cid);
   q.set('qn', String(qn || 64));
@@ -749,5 +801,6 @@ module.exports = {
   parseDanmakuXml,
   qnLabel,
   checkLogin,
+  diagnose,
   probeNvaPort: ssdp.probe,
 };
