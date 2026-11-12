@@ -400,21 +400,20 @@ function nvaSignQuery(params) {
 }
 
 /**
- * 拉取一个「电视真的能播」的播放地址。
+ * 拉取一个能投给电视的播放地址。
  *
- * 踩过的坑：x/tv/playurl 与 web 的 fnval=1 会给 PCDN 代理地址
- * （*.edge.mountaintoys.cn:4483），电视收到后一律「加载失败（错误码：null）」。
- * 实测 web 的 platform=html5 接口返回普通 *.bilivideo.com 直链，
- * 匿名也能给 720P，带登录 Cookie 一般还能更高，所以以它为主线路。
+ * 关键事实（都实测过）：
+ *   - `platform=html5&high_quality=1` 的地址**无 Referer 鉴权**，可直接给电视播；
+ *     登录后该参数可让画质上到 1080P（未登录 B 站只给 720P）
+ *   - `platform=pc` 的地址带 Referer 防盗链，电视裸连一律 403，
+ *     必须经本机流转发（bridge/lib/proxy.js）补上 Referer 才能播
  *
- * 顺序：
- *   1) 有登录 Cookie：先试 fnval=1 的 1080P 合并流，host 合格才采用
- *   2) platform=html5 主线路（720P，地址实测可播）
- *   3) 电视 App 匿名接口（360P）兜底
+ * 所以策略是：先要 html5 的免鉴权地址；拿不到目标清晰度时，
+ * 再用 pc 接口要更高的，并把地址标记为「需要本机转发」。
  *
  * @param {{aid?:number|string, bvid?:string, cid?:number|string, epId?:number|string,
  *          cookie?:string, qn?:number}} input
- * @returns {Promise<{url:string, qn:number, source:string, timelength:number,
+ * @returns {Promise<{url:string, qn:number, source:string, timelength:number, needsProxy:boolean,
  *                    accept:Array<{qn:number,label:string}>}>}
  */
 async function fetchPlayUrl(input) {
@@ -423,36 +422,53 @@ async function fetchPlayUrl(input) {
 
   const want = Number(input.qn) || 0;
   const tried = [];
-  let accept = [];
+  const cands = [];
 
-  if (input.cookie) {
-    const targets = want >= 80 ? [want, 80] : [80];
-    for (const qn of [...new Set(targets)]) {
+  // 1) html5 线路：地址免鉴权，登录后 high_quality=1 可到 1080P
+  try {
+    cands.push(await fetchPlayUrlViaHtml5(input, cid, want || 80));
+  } catch (err) {
+    tried.push(`html5（${err.message}）`);
+  }
+
+  // 2) 目标档位比 html5 给的高，再向 pc 接口要一次（地址走本机转发）
+  const top = pickBest(cands);
+  if (want >= 80 && (!top || top.qn < want)) {
+    for (const qn of [...new Set([want, 80])]) {
+      if (top && qn <= top.qn) continue;
       try {
         const r = await fetchPlayUrlViaWeb(input, cid, qn);
-        accept = mergeAccept(accept, r.accept);
-        if (isPlayableStreamUrl(r.url)) return { ...r, accept: mergeAccept(accept, r.accept) };
-        tried.push(`网页 qn=${qn}（地址电视播不了）`);
+        cands.push(r);
+        if (r.qn >= want) break;
       } catch (err) {
         tried.push(`网页 qn=${qn}（${err.message}）`);
       }
     }
   }
 
-  try {
-    const r = await fetchPlayUrlViaHtml5(input, cid, want || 64);
-    return { ...r, accept: mergeAccept(accept, r.accept) };
-  } catch (err) {
-    tried.push(`html5（${err.message}）`);
+  const winner = pickBest(cands);
+  if (winner) {
+    return { ...winner, accept: mergeAccept(...cands.map((c) => c.accept)) };
   }
 
+  // 3) 电视 App 接口兜底（清晰度最低，且 accept 列表虚高，不并入 UI）
   try {
     const r = await fetchPlayUrlViaTv(input, cid, want);
-    return { ...r, accept: mergeAccept(accept, r.accept) };
+    return { ...r, accept: [] };
   } catch (err) {
     tried.push(`电视接口（${err.message}）`);
     throw new Error(`获取播放地址失败：${tried.join('；')}`);
   }
+}
+
+/** 候选里挑一个：清晰度高的优先；同清晰度优先不需要转发的 */
+function pickBest(list) {
+  const usable = (list || []).filter((x) => x && x.url);
+  if (!usable.length) return null;
+  return usable.sort((a, b) => {
+    if (b.qn !== a.qn) return b.qn - a.qn;
+    return Number(a.needsProxy) - Number(b.needsProxy);
+  })[0];
 }
 
 /** 兼容兜底：只走电视 App 匿名接口（360P），用于自动降级 */
@@ -493,18 +509,19 @@ async function fetchPlayUrlViaHtml5(input, cid, qn) {
   }
   const url = pickDurl(json.data);
   if (!url) throw new Error('没有返回合并流');
-  if (!isPlayableStreamUrl(url)) throw new Error('地址电视播不了');
 
   return {
     url,
     qn: Number(json.data.quality) || qn,
     source: 'html5',
     timelength: Number(json.data.timelength) || 0,
+    // html5 线路理论上免鉴权；万一给了非常规地址，也走本机转发兜住
+    needsProxy: !isPlayableStreamUrl(url),
     accept: normalizeAccept(json.data),
   };
 }
 
-/** fnval=1：网页端合并流，登录后有机会到 1080P（地址可能是代理，需校验） */
+/** fnval=1：网页端合并流，登录后可到 1080P；地址有 Referer 鉴权，必须走本机转发 */
 async function fetchPlayUrlViaWeb(input, cid, qn) {
   const q = buildStreamQuery(input, cid);
   q.set('qn', String(qn || 80));
@@ -527,6 +544,7 @@ async function fetchPlayUrlViaWeb(input, cid, qn) {
     qn: Number(json.data.quality) || qn,
     source: 'web',
     timelength: Number(json.data.timelength) || 0,
+    needsProxy: true,
     accept: normalizeAccept(json.data),
   };
 }
@@ -571,6 +589,7 @@ async function fetchPlayUrlViaTv(input, cid, qn) {
     qn: Number(json.data.quality) || 0,
     source: 'tv',
     timelength: Number(json.data.timelength) || 0,
+    needsProxy: true,
     accept: normalizeAccept(json.data),
   };
 }
@@ -591,5 +610,6 @@ module.exports = {
   fetchFallbackStream,
   isPlayableStreamUrl,
   parseDanmakuXml,
+  qnLabel,
   probeNvaPort: ssdp.probe,
 };

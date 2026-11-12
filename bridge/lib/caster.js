@@ -13,6 +13,7 @@
  */
 
 const { EventEmitter } = require('events');
+const os = require('os');
 const nva = require('./nva');
 const bili = require('./bili');
 
@@ -53,8 +54,11 @@ class Caster extends EventEmitter {
     this.stream = null;
     this.quality = 0;
     this.qualities = [];
+    this.qualityNote = '';
     this.accessCookie = '';
     this.requestedQn = 0;
+    this.proxy = opts.proxy || null;
+    this._playUrlCache = null;
     this._pendingSeek = 0;
     this._seekTries = 0;
     this._lastSeekAt = 0;
@@ -94,7 +98,9 @@ class Caster extends EventEmitter {
         qn: this.quality,
         label: qualityLabel(this.qualities, this.quality),
         source: this.stream ? this.stream.source : '',
+        needsProxy: Boolean(this.stream && this.stream.needsProxy),
       },
+      qualityNote: this.qualityNote,
       qualities: this.qualities,
       danmaku: {
         mode: this.danmakuMode,
@@ -212,6 +218,8 @@ class Caster extends EventEmitter {
    */
   async cast(device, video, opts = {}) {
     this._stoppedByUser = false;
+    this._playUrlCache = null;
+    this.qualityNote = '';
 
     if (DANMAKU_MODES.includes(opts.danmakuMode)) this.danmakuMode = opts.danmakuMode;
     else if (typeof opts.danmaku === 'boolean') this.danmakuMode = opts.danmaku ? 'native' : 'off';
@@ -261,10 +269,14 @@ class Caster extends EventEmitter {
     this.stream = stream;
     this.quality = stream.qn;
     this.qualities = stream.accept && stream.accept.length ? stream.accept : [];
+    this.qualityNote = this._noteForQuality(this.requestedQn, stream);
     this._log(
       'info',
-      `播放地址已就绪：${qualityLabel(this.qualities, stream.qn)}（来源 ${stream.source}）`
+      `播放地址已就绪：${qualityLabel(this.qualities, stream.qn)}（来源 ${stream.source}${
+        stream.needsProxy ? '，走本机转发' : ''
+      }）`
     );
+    if (this.qualityNote) this._log('warn', this.qualityNote);
 
     // 3) 起播
     this.client.getVolume();
@@ -280,6 +292,73 @@ class Caster extends EventEmitter {
 
     await loadTask;
     this._emitState();
+  }
+
+  /**
+   * 把流地址转成电视能直接请求的地址。
+   *
+   * pc 线路的地址带 Referer 防盗链，电视裸连会 403（「加载失败」）；
+   * 这类地址登记到本机转发服务，改给电视一个本机地址，由桥接补 Referer 去取。
+   */
+  _playUrlFor(stream) {
+    if (!stream || !stream.url) throw new Error('没有可用的播放地址');
+    if (!stream.needsProxy) return stream.url;
+
+    if (!this.proxy || !this.proxy.running) {
+      this._log('warn', '本机转发未就绪，直接用原始地址（可能被 CDN 拒绝）');
+      return stream.url;
+    }
+
+    if (this._playUrlCache && this._playUrlCache.key === stream.url) {
+      return this._playUrlCache.url;
+    }
+
+    const host = this._lanIpForDevice();
+    if (!host) {
+      this._log('warn', '没找到局域网地址，无法转发，直接用原始地址');
+      return stream.url;
+    }
+
+    const token = this.proxy.register(stream.url, { qn: stream.qn });
+    const url = this.proxy.urlFor(host, token);
+    this._playUrlCache = { key: stream.url, url };
+    this._log('info', `该地址需登录态鉴权，已交给本机转发（${host}:${this.proxy.port}）`);
+    return url;
+  }
+
+  /** 目标清晰度没拿到时，给一句人话解释，避免用户以为是自己操作错了 */
+  _noteForQuality(target, stream) {
+    const want = Number(target) || 0;
+    if (!want || !stream || stream.qn >= want) return '';
+    const wantLabel = qualityLabel(this.qualities, want);
+    const gotLabel = qualityLabel(this.qualities, stream.qn);
+
+    if (want >= 112) return `${wantLabel} 需要大会员，已用 ${gotLabel}`;
+    if (want >= 80) {
+      return this.accessCookie
+        ? `${wantLabel} 该视频或账号不可用（部分视频需大会员），已用 ${gotLabel}`
+        : `${wantLabel} 需要先在浏览器登录 B 站，已用 ${gotLabel}`;
+    }
+    return `${wantLabel} 当前不可用，已用 ${gotLabel}`;
+  }
+
+  /** 找一块与电视同网段的本机网卡地址；找不到就挑一个像局域网的 */
+  _lanIpForDevice() {
+    const list = [];
+    for (const items of Object.values(os.networkInterfaces())) {
+      for (const it of items || []) {
+        if (it.family === 'IPv4' && !it.internal) list.push(it.address);
+      }
+    }
+    if (!list.length) return '';
+
+    const tv = this.device && this.device.ip;
+    if (tv && /^\d+\.\d+\.\d+\.\d+$/.test(tv)) {
+      const prefix = tv.split('.').slice(0, 3).join('.') + '.';
+      const same = list.find((ip) => ip.startsWith(prefix));
+      if (same) return same;
+    }
+    return list.find((ip) => ip.startsWith('192.168.')) || list.find((ip) => ip.startsWith('10.')) || list[0];
   }
 
   /**
@@ -313,7 +392,9 @@ class Caster extends EventEmitter {
       build: '106400100',
     };
 
-    const url = stream.url + '&nva_ext=' + encodeURIComponent(JSON.stringify({ ver: 2, content }));
+    const base = this._playUrlFor(stream);
+    const sep = base.includes('?') ? '&' : '?';
+    const url = base + sep + 'nva_ext=' + encodeURIComponent(JSON.stringify({ ver: 2, content }));
     this.client.sendCommand('PlayUrl', { url, title: video.title || '' });
     this._playIssuedAt = Date.now();
   }
@@ -345,6 +426,7 @@ class Caster extends EventEmitter {
       this.stream = stream;
       this.quality = stream.qn;
       if (stream.accept && stream.accept.length) this.qualities = stream.accept;
+      this.qualityNote = this._noteForQuality(target, stream);
 
       this.queue = [];
       this.cursor = this._lowerBound(pos);
@@ -353,18 +435,18 @@ class Caster extends EventEmitter {
       this.playState = PLAY_STATE.LOADING;
       this._pendingSeek = pos > 3 ? pos : 0;
       this._seekTries = 0;
+      this._playUrlCache = null;
 
       this._sendPlayUrl(stream, pos);
       this._applyDanmakuMode();
       this._armWatchdog(0);
 
       const label = qualityLabel(this.qualities, stream.qn);
-      this._log(
-        'info',
-        stream.qn === target
-          ? `已切换到 ${label}，从 ${pos} 秒继续`
-          : `目标清晰度不可用，已用 ${label}，从 ${pos} 秒继续`
-      );
+      if (stream.qn === target) {
+        this._log('info', `已切换到 ${label}，从 ${pos} 秒继续`);
+      } else {
+        this._log('warn', this.qualityNote || `目标清晰度不可用，已用 ${label}，从 ${pos} 秒继续`);
+      }
       this._emitState();
       return this.snapshot();
     } finally {
@@ -470,6 +552,7 @@ class Caster extends EventEmitter {
     this.state = 'idle';
     this.playState = PLAY_STATE.STOPPED;
     this.queue = [];
+    this._playUrlCache = null;
     this._log('info', '已停止投屏');
     this._emitState();
 
@@ -532,6 +615,8 @@ class Caster extends EventEmitter {
             (a, b) => b.qn - a.qn
           );
         }
+        this._playUrlCache = null;
+        this.qualityNote = `电视加载原清晰度失败，已降到 ${qualityLabel(this.qualities, stream.qn)}`;
         this._sendPlayUrl(stream, this.position);
         this._pendingSeek = this.position > 3 ? this.position : 0;
         this._seekTries = 0;
@@ -755,7 +840,10 @@ class Caster extends EventEmitter {
 
 function qualityLabel(list, qn) {
   const hit = (list || []).find((q) => Number(q.qn) === Number(qn));
-  return hit ? hit.label : qn ? `QN${qn}` : '自动';
+  if (hit) return hit.label;
+  if (!qn) return '自动';
+  // 当前账号拿不到该档位时列表里没有它，仍要显示 B 站官方叫法（如「高清 1080P」）
+  return typeof bili.qnLabel === 'function' ? bili.qnLabel(qn) : `QN${qn}`;
 }
 
 function stateText(code) {

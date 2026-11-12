@@ -25,6 +25,7 @@ const els = {
   progressBar: $('progressBar'),
   statusSub: $('statusSub'),
   qualitySelect: $('qualitySelect'),
+  qualityNote: $('qualityNote'),
   pauseBtn: $('pauseBtn'),
   seekBackBtn: $('seekBackBtn'),
   logBox: $('logBox'),
@@ -595,6 +596,16 @@ function applyState(state) {
     const deviceName = (state.device && (state.device.name || state.device.ip)) || '电视';
     const qnText = state.quality && state.quality.label ? ` · ${state.quality.label}` : '';
     els.statusSub.textContent = `${deviceName} · ${dmText}${qnText}`;
+
+    // 目标清晰度没拿到时，把原因说清楚，而不是静默降一档
+    const note = state.qualityNote || '';
+    if (note) {
+      els.qualityNote.textContent = note;
+      els.qualityNote.classList.remove('hidden');
+    } else {
+      els.qualityNote.textContent = '';
+      els.qualityNote.classList.add('hidden');
+    }
 
     renderQualities(state);
     renderDanmakuMode(state);

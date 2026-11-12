@@ -22,15 +22,20 @@ const ws = require('./lib/ws');
 const ssdp = require('./lib/ssdp');
 const bili = require('./lib/bili');
 const { Caster } = require('./lib/caster');
+const { StreamProxy } = require('./lib/proxy');
 const nva = require('./lib/nva');
 
 const PORT = Number(process.env.BILI_CAST_PORT || 8787);
+const PROXY_PORT = Number(process.env.BILI_CAST_PROXY_PORT || 8790);
 const HOST = '127.0.0.1';
 const VERSION = '1.0.0';
-const BUILD = '1.3.0';
+const BUILD = '1.3.1';
 const SERVICE = 'bili-tv-cast';
 
-const caster = new Caster();
+// 流转发：pc 线路的地址有 Referer 防盗链，电视裸连会 403，需要本机代取
+const proxy = new StreamProxy({ port: PROXY_PORT, onLog: (level, msg) => log(level, msg) });
+
+const caster = new Caster({ proxy });
 let lastDevices = [];
 let scanning = false;
 
@@ -52,6 +57,7 @@ const server = http.createServer((req, res) => {
       version: VERSION,
       build: BUILD,
       uptime: process.uptime(),
+      proxy: proxy.snapshot(),
     });
   }
   if (req.url === '/state') {
@@ -443,6 +449,7 @@ function onListening() {
   console.log(`  版本      ${BUILD}`);
   console.log(`  本机地址  ${localAddresses().join('  ') || '(未检测到局域网地址)'}`);
   console.log(`  客户端 ID ${caster.clientUuid}`);
+  console.log(`  流转发    ${PROXY_PORT} 端口${proxy.running ? '（电视经此取流）' : '（未启动）'}`);
   console.log('  协议      NVA / 哔哩必连（B 站私有投屏协议，TCP 9958）');
   console.log('');
   console.log('  保持本窗口运行，然后在 Chrome 里点扩展图标即可投屏。');
@@ -452,6 +459,7 @@ function onListening() {
 (async () => {
   const free = await takeoverPort(PORT);
   if (!free) process.exit(1);
+  proxy.start();
   server.listen(PORT, HOST, onListening);
 })();
 
@@ -459,6 +467,11 @@ process.on('SIGINT', () => {
   log('info', '正在退出…');
   try {
     caster.stop();
+  } catch (_) {
+    /* ignore */
+  }
+  try {
+    proxy.stop();
   } catch (_) {
     /* ignore */
   }

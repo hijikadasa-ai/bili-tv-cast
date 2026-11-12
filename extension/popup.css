@@ -320,6 +320,21 @@ body {
   color: var(--ink-3);
 }
 
+/* 清晰度没拿到时的说明，避免用户以为是自己操作错了 */
+.quality-note {
+  margin-top: 6px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: #a2651b;
+  background: #fdf3e3;
+}
+
+.quality-note.hidden {
+  display: none;
+}
+
 .toggle-title {
   font-size: 12.5px;
   font-weight: 500;
