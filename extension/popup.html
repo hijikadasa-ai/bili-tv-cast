@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>小电视投屏</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="header">
+        <div class="brand">
+          <span class="logo" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none">
+              <rect x="2.6" y="6.4" width="18.8" height="13" rx="3.2" stroke="currentColor" stroke-width="1.9" />
+              <path d="M8.4 6.2 11 3.4M15.6 6.2 13 3.4" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" />
+              <path d="M10.3 10.7v4.4l3.6-2.2-3.6-2.2Z" fill="currentColor" />
+            </svg>
+          </span>
+          <span class="brand-text">小电视投屏</span>
+        </div>
+        <span id="bridgePill" class="pill pill-off">桥接未连接</span>
+      </header>
+
+      <section class="card">
+        <div class="card-label">当前视频</div>
+        <div id="videoTitle" class="video-title">正在读取页面…</div>
+        <div id="videoMeta" class="video-meta">—</div>
+      </section>
+
+      <section class="card">
+        <div class="row-between">
+          <div class="card-label">电视设备</div>
+          <button id="scanBtn" class="link-btn" type="button">重新搜索</button>
+        </div>
+        <div id="deviceList" class="device-list">
+          <div class="empty">正在搜索局域网内的云视听小电视…</div>
+        </div>
+        <details class="manual">
+          <summary>找不到？手动填 IP</summary>
+          <div class="manual-row">
+            <input id="manualIp" type="text" placeholder="192.168.1.23" inputmode="decimal" />
+            <button id="manualBtn" class="btn-ghost" type="button">添加</button>
+          </div>
+        </details>
+      </section>
+
+      <div class="setting-row">
+        <div class="setting-text">
+          <div class="toggle-title">电视上的弹幕</div>
+          <div class="toggle-hint" id="danmakuHint">交给电视自己渲染</div>
+        </div>
+        <select id="danmakuMode" class="mini-select">
+          <option value="native">电视自己渲染</option>
+          <option value="relay">电脑逐条推送</option>
+          <option value="off">关闭弹幕</option>
+        </select>
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-text">
+          <div class="toggle-title">网页悬浮球</div>
+          <div class="toggle-hint">B 站页面右下角，点一下就投屏</div>
+        </div>
+        <select id="ballEnabled" class="mini-select">
+          <option value="on">显示</option>
+          <option value="off">隐藏</option>
+        </select>
+      </div>
+
+      <button id="castBtn" class="primary" type="button" disabled>投屏到电视</button>
+
+      <section id="statusCard" class="card status hidden">
+        <div class="row-between">
+          <span id="statusText" class="status-text">播放中</span>
+          <span id="statusTime" class="status-time">00:00 / 00:00</span>
+        </div>
+        <div class="progress"><div id="progressBar" class="progress-bar"></div></div>
+        <div id="statusSub" class="status-sub"></div>
+        <div class="quality-row">
+          <span class="quality-label">清晰度</span>
+          <select id="qualitySelect" class="mini-select" disabled>
+            <option value="0">自动</option>
+          </select>
+        </div>
+        <div class="controls">
+          <button id="pauseBtn" class="btn-ghost" type="button">暂停</button>
+          <button id="seekBackBtn" class="btn-ghost" type="button">后退 10 秒</button>
+        </div>
+      </section>
+
+      <div id="logBox" class="logs"></div>
+    </div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

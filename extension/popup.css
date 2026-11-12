@@ -1,0 +1,505 @@
+:root {
+  --pink: #fb7299;
+  --pink-dark: #e35c85;
+  --ink: #18191c;
+  --ink-2: #61666d;
+  --ink-3: #9499a0;
+  --line: #e9eaec;
+  --bg: #ffffff;
+  --bg-soft: #f6f7f8;
+  --green: #2fa84f;
+  --amber: #d97706;
+  --red: #e5484d;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  width: 372px;
+  background: var(--bg);
+  color: var(--ink);
+  font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.app {
+  padding: 14px 14px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* ---------- 头部 ---------- */
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.logo {
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  background: linear-gradient(135deg, #ff9db8, var(--pink));
+  color: #fff;
+  display: grid;
+  place-items: center;
+}
+
+.brand-text {
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+}
+
+.pill {
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+
+.pill-off {
+  color: var(--red);
+  background: #fdecec;
+  border-color: #f8d3d3;
+}
+
+.pill-on {
+  color: var(--green);
+  background: #eaf7ee;
+  border-color: #cfe9d8;
+}
+
+.pill-busy {
+  color: var(--amber);
+  background: #fdf4e3;
+  border-color: #f5e2bd;
+}
+
+/* ---------- 卡片 ---------- */
+
+.card {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 11px;
+  background: var(--bg);
+}
+
+.card-label {
+  font-size: 11px;
+  color: var(--ink-3);
+  letter-spacing: 0.4px;
+  margin-bottom: 4px;
+}
+
+.video-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.video-meta {
+  margin-top: 3px;
+  font-size: 11.5px;
+  color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.row-between {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.link-btn {
+  border: none;
+  background: none;
+  color: var(--pink-dark);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 0;
+}
+
+.link-btn:hover {
+  text-decoration: underline;
+}
+
+.link-btn:disabled {
+  color: var(--ink-3);
+  cursor: default;
+  text-decoration: none;
+}
+
+/* ---------- 设备列表 ---------- */
+
+.device-list {
+  margin-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 132px;
+  overflow-y: auto;
+}
+
+.device {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.device:hover {
+  border-color: #f3c2d1;
+  background: #fffafc;
+}
+
+.device.active {
+  border-color: var(--pink);
+  background: #fff5f8;
+}
+
+.device-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--pink);
+  flex: 0 0 auto;
+}
+
+.device-body {
+  min-width: 0;
+  flex: 1;
+}
+
+.device-name {
+  font-size: 12.5px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.device-sub {
+  font-size: 11px;
+  color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.badge {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: #fff0f4;
+  color: var(--pink-dark);
+  border: 1px solid #fbd0dd;
+  white-space: nowrap;
+}
+
+.empty {
+  font-size: 12px;
+  color: var(--ink-3);
+  padding: 10px 2px;
+  text-align: center;
+}
+
+.manual {
+  margin-top: 8px;
+  font-size: 11.5px;
+  color: var(--ink-3);
+}
+
+.manual summary {
+  cursor: pointer;
+  list-style: none;
+  color: var(--ink-2);
+  padding: 2px 0;
+}
+
+.manual summary::-webkit-details-marker {
+  display: none;
+}
+
+.manual-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.manual input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  font-size: 12px;
+  font-family: inherit;
+  color: var(--ink);
+  outline: none;
+}
+
+.manual input:focus {
+  border-color: var(--pink);
+}
+
+/* ---------- 弹幕 / 清晰度 选择 ---------- */
+
+.toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 2px 2px;
+}
+
+.setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 11px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.setting-text {
+  min-width: 0;
+}
+
+.mini-select {
+  flex: 0 0 auto;
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--ink);
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 5px 6px;
+  cursor: pointer;
+  outline: none;
+}
+
+.mini-select:focus {
+  border-color: var(--pink);
+}
+
+.mini-select:disabled {
+  color: var(--ink-3);
+  background: var(--bg-soft);
+  cursor: default;
+}
+
+.quality-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 9px;
+}
+
+.quality-label {
+  font-size: 11.5px;
+  color: var(--ink-3);
+}
+
+.toggle-title {
+  font-size: 12.5px;
+  font-weight: 500;
+}
+
+.toggle-hint {
+  font-size: 11px;
+  color: var(--ink-3);
+}
+
+.switch {
+  position: relative;
+  display: inline-block;
+  width: 36px;
+  height: 20px;
+  flex: 0 0 auto;
+}
+
+.switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.slider {
+  position: absolute;
+  inset: 0;
+  background: #d7d9dd;
+  border-radius: 999px;
+  transition: background 0.18s;
+  cursor: pointer;
+}
+
+.slider::before {
+  content: "";
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  left: 2px;
+  top: 2px;
+  background: #fff;
+  border-radius: 50%;
+  transition: transform 0.18s;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.16);
+}
+
+.switch input:checked + .slider {
+  background: var(--pink);
+}
+
+.switch input:checked + .slider::before {
+  transform: translateX(16px);
+}
+
+/* ---------- 按钮 ---------- */
+
+.primary {
+  width: 100%;
+  padding: 10px;
+  border: none;
+  border-radius: 9px;
+  background: linear-gradient(135deg, #ff87ab, var(--pink));
+  color: #fff;
+  font-size: 13.5px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  cursor: pointer;
+  transition: filter 0.15s, opacity 0.15s;
+}
+
+.primary:hover:not(:disabled) {
+  filter: brightness(1.04);
+}
+
+.primary:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.primary.stop {
+  background: #fdf2f4;
+  color: #d9373c;
+  box-shadow: inset 0 0 0 1px #f6d6d8;
+}
+
+.btn-ghost {
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fff;
+  color: var(--ink-2);
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.btn-ghost:hover {
+  border-color: #d9dbdf;
+  background: var(--bg-soft);
+}
+
+.btn-ghost.danger {
+  color: var(--red);
+  border-color: #f6d6d8;
+}
+
+.btn-ghost.danger:hover {
+  background: #fdf4f4;
+}
+
+/* ---------- 状态 ---------- */
+
+.status.hidden {
+  display: none;
+}
+
+.status-text {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.status-time {
+  font-size: 12px;
+  color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.progress {
+  height: 4px;
+  border-radius: 999px;
+  background: #f0f1f3;
+  margin: 8px 0 6px;
+  overflow: hidden;
+}
+
+.progress-bar {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #ff9db8, var(--pink));
+  transition: width 0.6s linear;
+}
+
+.status-sub {
+  font-size: 11.5px;
+  color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.controls {
+  display: flex;
+  gap: 8px;
+  margin-top: 9px;
+}
+
+/* ---------- 日志 ---------- */
+
+.logs {
+  font-size: 11px;
+  color: var(--ink-3);
+  line-height: 1.55;
+  max-height: 66px;
+  overflow-y: auto;
+  border-top: 1px dashed var(--line);
+  padding-top: 7px;
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 1px;
+}
+
+.log-line {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.log-line.warn {
+  color: var(--amber);
+}
+
+.log-line.error {
+  color: var(--red);
+}

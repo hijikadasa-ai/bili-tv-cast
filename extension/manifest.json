@@ -1,0 +1,44 @@
+{
+  "manifest_version": 3,
+  "name": "小电视投屏 · B站协议",
+  "version": "1.2.0",
+  "description": "用 B 站私有协议（NVA / 哔哩必连）把网页视频投到云视听小电视，并在电视上同步滚动弹幕。网页右下角悬浮球可一键投屏。",
+  "permissions": ["storage", "activeTab", "scripting", "cookies"],
+  "host_permissions": ["*://*.bilibili.com/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "小电视投屏",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://www.bilibili.com/video/*",
+        "*://www.bilibili.com/bangumi/play/*",
+        "*://www.bilibili.com/list/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["inject.js"],
+      "matches": ["*://*.bilibili.com/*"]
+    }
+  ]
+}

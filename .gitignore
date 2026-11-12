@@ -1,0 +1,17 @@
+# 便携版 Node 运行时（约 84MB），不进仓库
+# 想开箱即用请下载 Release 里的便携包，或自行安装 Node.js 18+
+node/
+
+# 打包产物
+*.zip
+*.7z
+
+# 依赖
+node_modules/
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
