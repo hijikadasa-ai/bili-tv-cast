@@ -463,18 +463,30 @@ async function fetchPlayUrl(input) {
   }
 
   const winner = pickBest(cands);
-  if (winner) {
+  if (winner && (!want || winner.qn >= want)) {
     return { ...winner, accept: mergeAccept(...cands.map((c) => c.accept)), lines };
   }
 
-  // 3) 电视 App 接口兜底（清晰度最低，且 accept 列表虚高，不并入 UI）
+  // 3) 电视/App 端接口：返回的是合并好的 mp4（durl），
+  //    它的权限口径和网页端不同——文档里 qn=80 就是 TV 端默认，登录即可。
+  //    网页端新视频的 1080P 只剩 DASH 分轨时，这条路常常还有 mp4。
   try {
-    const r = await fetchPlayUrlViaTv(input, cid, want);
-    return { ...r, accept: [], lines };
+    const r = await fetchPlayUrlViaTv(input, cid, want || 80);
+    // 电视接口的 accept 列表虚高（匿名也报 112/80），不作为 UI 清晰度来源
+    r.accept = [];
+    cands.push(r);
+    lines.push({ source: 'tv', qn: r.qn });
   } catch (err) {
     tried.push(`电视接口（${err.message}）`);
-    throw new Error(`获取播放地址失败：${tried.join('；')}`);
+    lines.push({ source: 'tv', qn: 0, err: err.message });
   }
+
+  const best = pickBest(cands);
+  if (best) {
+    return { ...best, accept: mergeAccept(...cands.map((c) => c.accept)), lines };
+  }
+
+  throw new Error(`获取播放地址失败：${tried.join('；')}`);
 }
 
 /** 候选里挑一个：清晰度高的优先；同清晰度优先不需要转发的 */
@@ -765,6 +777,7 @@ async function fetchPlayUrlViaTv(input, cid, qn) {
       'User-Agent': STREAM_UA,
       Referer: STREAM_REFERER,
       Origin: 'https://www.bilibili.com',
+      ...(input.cookie ? { Cookie: String(input.cookie).includes('=') ? String(input.cookie) : `SESSDATA=${input.cookie}` } : {}),
     },
   });
   if (json.code !== 0 || !json.data) {
