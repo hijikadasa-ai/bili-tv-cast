@@ -29,7 +29,7 @@ const PORT = Number(process.env.BILI_CAST_PORT || 8787);
 const PROXY_PORT = Number(process.env.BILI_CAST_PROXY_PORT || 8790);
 const HOST = '127.0.0.1';
 const VERSION = '1.0.0';
-const BUILD = '1.3.1';
+const BUILD = '1.3.2';
 const SERVICE = 'bili-tv-cast';
 
 // 流转发：pc 线路的地址有 Referer 防盗链，电视裸连会 403，需要本机代取

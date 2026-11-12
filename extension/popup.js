@@ -448,11 +448,16 @@ async function doCast() {
   els.castBtn.textContent = '正在投屏…';
   addLog(`投屏到 ${device.name || device.ip}，从 ${fmtTime(video.currentTime)} 开始`);
 
-  // 读 B 站登录 Cookie（SESSDATA），让桥接能拿到更高清晰度的播放地址
+  // 读 B 站登录 Cookie（含 SESSDATA + buvid 等），让桥接能拿到更高清晰度的播放地址
   let sessdata = '';
   try {
-    const c = await chrome.cookies.get({ url: 'https://www.bilibili.com/', name: 'SESSDATA' });
-    sessdata = c ? c.value : '';
+    const names = ['SESSDATA', 'buvid3', 'buvid4', 'bili_jct', 'DedeUserID', 'sid'];
+    const pairs = [];
+    for (const name of names) {
+      const c = await chrome.cookies.get({ url: 'https://www.bilibili.com/', name });
+      if (c && c.value) pairs.push(`${name}=${c.value}`);
+    }
+    sessdata = pairs.join('; ');
   } catch (_) {
     /* 没有 cookies 权限时忽略 */
   }

@@ -422,39 +422,55 @@ async function fetchPlayUrl(input) {
 
   const want = Number(input.qn) || 0;
   const tried = [];
+  const lines = [];
   const cands = [];
 
   // 1) html5 线路：地址免鉴权，登录后 high_quality=1 可到 1080P
   try {
-    cands.push(await fetchPlayUrlViaHtml5(input, cid, want || 80));
+    const r = await fetchPlayUrlViaHtml5(input, cid, want || 80);
+    cands.push(r);
+    lines.push({ source: 'html5', qn: r.qn });
   } catch (err) {
     tried.push(`html5（${err.message}）`);
+    lines.push({ source: 'html5', qn: 0, err: err.message });
   }
 
-  // 2) 目标档位比 html5 给的高，再向 pc 接口要一次（地址走本机转发）
+  // 2) 目标档位比 html5 给的高，再按「网页播放器同款」顺序要更高的：
+  //    wbi 签名接口（最贴近真实网页播放）→ 老接口（fnval=1, platform=pc）
   const top = pickBest(cands);
   if (want >= 80 && (!top || top.qn < want)) {
     for (const qn of [...new Set([want, 80])]) {
       if (top && qn <= top.qn) continue;
       try {
+        const r = await fetchPlayUrlViaWbi(input, cid, qn);
+        cands.push(r);
+        lines.push({ source: 'wbi', qn: r.qn });
+        if (r.qn >= want) break;
+      } catch (err) {
+        tried.push(`wbi qn=${qn}（${err.message}）`);
+        lines.push({ source: 'wbi', qn: 0, err: err.message });
+      }
+      try {
         const r = await fetchPlayUrlViaWeb(input, cid, qn);
         cands.push(r);
+        lines.push({ source: 'web', qn: r.qn });
         if (r.qn >= want) break;
       } catch (err) {
         tried.push(`网页 qn=${qn}（${err.message}）`);
+        lines.push({ source: 'web', qn: 0, err: err.message });
       }
     }
   }
 
   const winner = pickBest(cands);
   if (winner) {
-    return { ...winner, accept: mergeAccept(...cands.map((c) => c.accept)) };
+    return { ...winner, accept: mergeAccept(...cands.map((c) => c.accept)), lines };
   }
 
   // 3) 电视 App 接口兜底（清晰度最低，且 accept 列表虚高，不并入 UI）
   try {
     const r = await fetchPlayUrlViaTv(input, cid, want);
-    return { ...r, accept: [] };
+    return { ...r, accept: [], lines };
   } catch (err) {
     tried.push(`电视接口（${err.message}）`);
     throw new Error(`获取播放地址失败：${tried.join('；')}`);
@@ -490,8 +506,91 @@ function buildStreamQuery(input, cid) {
 
 function cookieHeaders(cookie) {
   const headers = { 'User-Agent': UA, Referer: 'https://www.bilibili.com/' };
-  if (cookie) headers.Cookie = `SESSDATA=${cookie}`;
+  const raw = String(cookie || '').trim();
+  if (raw) {
+    // 兼容两种形态：完整 "k=v; k=v" 串，或只有 SESSDATA 裸值（裸值里不会出现 =）
+    headers.Cookie = raw.includes('=') ? raw : `SESSDATA=${raw}`;
+  }
   return headers;
+}
+
+// ------------------------------------------------------------------ Wbi 签名
+// B 站网页播放器走的是 x/player/wbi/playurl（带 wbi 签名），这是和
+// 「用户实际看到的画质」最一致的一条线路；老的 playurl 接口在部分
+// 账号/环境下会被风控悄悄压回 720P。
+
+const MIXIN_TAB = [
+  46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33,
+  9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61, 26,
+  17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34,
+  44, 52,
+];
+
+let wbiCache = { keys: null, at: 0 };
+
+function basenameNoExt(u) {
+  const name = String(u || '').split('/').pop() || '';
+  return name.replace(/\.[a-z]+$/i, '');
+}
+
+async function getWbiKeys() {
+  if (wbiCache.keys && Date.now() - wbiCache.at < 3600 * 1000) return wbiCache.keys;
+  const json = await getJson('https://api.bilibili.com/x/web-interface/nav');
+  const img = json && json.data && json.data.wbi_img;
+  if (!img || !img.img_url || !img.sub_url) throw new Error('拿不到 wbi 密钥');
+  const keys = {
+    img: basenameNoExt(img.img_url),
+    sub: basenameNoExt(img.sub_url),
+  };
+  wbiCache = { keys, at: Date.now() };
+  return keys;
+}
+
+function wbiMixinKey(keys) {
+  const orig = keys.img + keys.sub;
+  let out = '';
+  for (const i of MIXIN_TAB) if (orig[i]) out += orig[i];
+  return out.slice(0, 32);
+}
+
+function wbiSign(params, mixinKey) {
+  const cleaned = {};
+  for (const [k, v] of Object.entries(params)) {
+    // 官方前端同款：过滤值里的 !'()* 字符
+    cleaned[k] = String(v).replace(/[!'()*]/g, '');
+  }
+  cleaned.wts = Math.floor(Date.now() / 1000);
+  const query = Object.keys(cleaned)
+    .sort()
+    .map((k) => `${encodeURIComponent(k)}=${encodeURIComponent(cleaned[k])}`)
+    .join('&');
+  const sign = crypto.createHash('md5').update(query + mixinKey).digest('hex');
+  return `${query}&w_rid=${sign}`;
+}
+
+/** 登录态校验（带缓存）：用于把「拿不到 1080P」的原因说准 */
+let loginCache = { key: '', at: 0, info: null };
+async function checkLogin(cookie) {
+  const key = String(cookie || '');
+  if (!key) return { isLogin: false, uname: '', vip: 0 };
+  if (loginCache.key === key && Date.now() - loginCache.at < 5 * 60 * 1000) {
+    return loginCache.info;
+  }
+  let info = { isLogin: false, uname: '', vip: 0 };
+  try {
+    const json = await getJson('https://api.bilibili.com/x/web-interface/nav', {
+      headers: cookieHeaders(key),
+    });
+    const d = json && json.data;
+    if (d && d.isLogin) {
+      info = { isLogin: true, uname: d.uname || '', vip: Number(d.vipStatus) || 0 };
+    }
+  } catch (_) {
+    /* 网络问题不当作未登录，保持默认并让拉流线路自己说话 */
+    info = { isLogin: null, uname: '', vip: 0 };
+  }
+  loginCache = { key, at: Date.now(), info };
+  return info;
 }
 
 async function fetchPlayUrlViaHtml5(input, cid, qn) {
@@ -543,6 +642,44 @@ async function fetchPlayUrlViaWeb(input, cid, qn) {
     url,
     qn: Number(json.data.quality) || qn,
     source: 'web',
+    timelength: Number(json.data.timelength) || 0,
+    needsProxy: true,
+    accept: normalizeAccept(json.data),
+  };
+}
+
+/** x/player/wbi/playurl：B 站网页播放器实际使用的接口（带 wbi 签名），
+ *  对登录账号的 1080P 授权判定最准确；地址有 Referer 鉴权，走本机转发 */
+async function fetchPlayUrlViaWbi(input, cid, qn) {
+  const q = {
+    cid: String(cid),
+    qn: String(qn || 80),
+    fnval: '1',
+    fnver: '0',
+    fourk: '1',
+    platform: 'pc',
+    high_quality: '1',
+  };
+  if (input.epId) q.ep_id = String(input.epId);
+  if (input.bvid) q.bvid = String(input.bvid);
+  else if (input.aid) q.avid = String(input.aid);
+
+  const keys = await getWbiKeys();
+  const query = wbiSign(q, wbiMixinKey(keys));
+
+  const json = await getJson(`https://api.bilibili.com/x/player/wbi/playurl?${query}`, {
+    headers: cookieHeaders(input.cookie),
+  });
+  if (json.code !== 0 || !json.data) {
+    throw new Error(json.message || `code ${json.code}`);
+  }
+  const url = pickDurl(json.data);
+  if (!url) throw new Error('没有返回合并流');
+
+  return {
+    url,
+    qn: Number(json.data.quality) || qn,
+    source: 'wbi',
     timelength: Number(json.data.timelength) || 0,
     needsProxy: true,
     accept: normalizeAccept(json.data),
@@ -611,5 +748,6 @@ module.exports = {
   isPlayableStreamUrl,
   parseDanmakuXml,
   qnLabel,
+  checkLogin,
   probeNvaPort: ssdp.probe,
 };

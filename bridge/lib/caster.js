@@ -269,7 +269,7 @@ class Caster extends EventEmitter {
     this.stream = stream;
     this.quality = stream.qn;
     this.qualities = stream.accept && stream.accept.length ? stream.accept : [];
-    this.qualityNote = this._noteForQuality(this.requestedQn, stream);
+    this.qualityNote = await this._noteForQuality(this.requestedQn, stream);
     this._log(
       'info',
       `播放地址已就绪：${qualityLabel(this.qualities, stream.qn)}（来源 ${stream.source}${
@@ -327,17 +327,34 @@ class Caster extends EventEmitter {
   }
 
   /** 目标清晰度没拿到时，给一句人话解释，避免用户以为是自己操作错了 */
-  _noteForQuality(target, stream) {
+  async _noteForQuality(target, stream) {
     const want = Number(target) || 0;
     if (!want || !stream || stream.qn >= want) return '';
     const wantLabel = qualityLabel(this.qualities, want);
     const gotLabel = qualityLabel(this.qualities, stream.qn);
 
+    // 把各线路的实际返回写进日志，方便定位是哪一步被压了清晰度
+    if (Array.isArray(stream.lines) && stream.lines.length) {
+      const desc = stream.lines
+        .map((l) => `${l.source}${l.qn ? `=${l.qn}` : `失败(${l.err || '?'})`}`)
+        .join('，');
+      this._log('info', `各线路返回：${desc}`);
+    }
+
     if (want >= 112) return `${wantLabel} 需要大会员，已用 ${gotLabel}`;
     if (want >= 80) {
-      return this.accessCookie
-        ? `${wantLabel} 该视频或账号不可用（部分视频需大会员），已用 ${gotLabel}`
-        : `${wantLabel} 需要先在浏览器登录 B 站，已用 ${gotLabel}`;
+      if (!this.accessCookie) {
+        return `${wantLabel} 需要先在浏览器登录 B 站，已用 ${gotLabel}`;
+      }
+      // 有 cookie 却没拿到 1080P：先校验登录态，别冤枉用户的账号
+      const login = await bili.checkLogin(this.accessCookie);
+      if (login.isLogin === false) {
+        return 'B 站登录已失效，请在浏览器退出并重新登录 B 站，再点一次投屏';
+      }
+      if (login.isLogin && login.vip) {
+        return `${wantLabel} 该视频不可用（大会员线路未生效），已用 ${gotLabel}`;
+      }
+      return `${wantLabel} 该视频或账号不可用（部分视频需大会员），已用 ${gotLabel}`;
     }
     return `${wantLabel} 当前不可用，已用 ${gotLabel}`;
   }
@@ -426,7 +443,7 @@ class Caster extends EventEmitter {
       this.stream = stream;
       this.quality = stream.qn;
       if (stream.accept && stream.accept.length) this.qualities = stream.accept;
-      this.qualityNote = this._noteForQuality(target, stream);
+      this.qualityNote = await this._noteForQuality(target, stream);
 
       this.queue = [];
       this.cursor = this._lowerBound(pos);

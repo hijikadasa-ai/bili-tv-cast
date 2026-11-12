@@ -228,8 +228,19 @@ function call(type, payload = {}, timeout = 20000) {
 
 async function sessdata() {
   try {
-    const c = await chrome.cookies.get({ url: 'https://www.bilibili.com/', name: 'SESSDATA' });
-    return c ? c.value : '';
+    // 只带 SESSDATA 时，B 站部分接口会被风控悄悄压回 720P；
+    // 按真实浏览器的样子把整串登录 Cookie 带上
+    const names = ['SESSDATA', 'buvid3', 'buvid4', 'bili_jct', 'DedeUserID', 'sid'];
+    const pairs = [];
+    for (const name of names) {
+      try {
+        const c = await chrome.cookies.get({ url: 'https://www.bilibili.com/', name });
+        if (c && c.value) pairs.push(`${name}=${c.value}`);
+      } catch (_) {
+        /* 单个 cookie 读取失败不影响其他 */
+      }
+    }
+    return pairs.join('; ');
   } catch (_) {
     return '';
   }
