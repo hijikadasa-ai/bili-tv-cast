@@ -41,7 +41,7 @@
 
 ### 方式一：便携包（推荐给普通用户）
 
-到 [Releases](../../releases) 下载最新 `小电视投屏-便携包.zip`，解压后：
+到 [Releases](../../releases/latest) 下载最新的便携包（`bili-tv-cast-v1.3.0-portable.zip`），解压后：
 
 1. 双击 **`1.启动桥接.bat`** —— 出现一个黑窗口，保持它开着（关掉就断开投屏）
 2. 双击 **`2.安装到浏览器.bat`** —— 它会复制扩展并打开 `chrome://extensions/`
