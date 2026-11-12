@@ -493,22 +493,24 @@ body {
 /* ---------- 日志 ---------- */
 
 .logs {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--ink-3);
-  line-height: 1.55;
-  max-height: 66px;
+  line-height: 1.5;
+  max-height: 130px;
   overflow-y: auto;
   border-top: 1px dashed var(--line);
   padding-top: 7px;
   display: flex;
   flex-direction: column-reverse;
-  gap: 1px;
+  gap: 2px;
+  flex: none;
 }
 
 .log-line {
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: normal;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  flex: none;
 }
 
 .log-line.warn {

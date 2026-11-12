@@ -49,6 +49,32 @@ class StreamProxy {
     return `http://${host}:${this.port}/s/${token}.mp4`;
   }
 
+  /**
+   * 登记一路 DASH（音视频分轨），生成给电视用的 MPD 清单地址。
+   * 电视端的播放器本身是吃 DASH 的（B 站 TV 客户端本来就这么播），
+   * 所以把分轨地址包装成本机 MPD，比在电脑上转码更省资源、还能拖动。
+   */
+  registerDash(dash, meta = {}) {
+    this._gc();
+    const token = crypto.randomBytes(12).toString('hex');
+    const videoToken = this.register(dash.video.url, { qn: dash.video.id, kind: 'dash-video' });
+    const audioToken = this.register(dash.audio.url, { kind: 'dash-audio' });
+    this.routes.set(token, {
+      kind: 'dash',
+      dash,
+      videoToken,
+      audioToken,
+      expires: Date.now() + TTL_MS,
+      ...meta,
+    });
+    return token;
+  }
+
+  /** 给电视用的 MPD 地址（部分播放器只认 .mp4 后缀，两种都留） */
+  mpdFor(host, token) {
+    return `http://${host}:${this.port}/mpd/${token}.mp4`;
+  }
+
   start() {
     if (this.running) return this;
     this.server = http.createServer((req, res) => this._handle(req, res));
@@ -89,6 +115,24 @@ class StreamProxy {
 
   _handle(req, res) {
     const path = String(req.url || '').split('?')[0];
+
+    const mpd = /^\/mpd\/([a-f0-9]{16,64})\.(mpd|mp4)$/.exec(path);
+    if (mpd) {
+      const item = this.routes.get(mpd[1]);
+      if (!item || item.kind !== 'dash' || item.expires <= Date.now()) {
+        this.denied++;
+        res.writeHead(410, { 'Content-Type': 'text/plain; charset=utf-8' });
+        return res.end('mpd expired');
+      }
+      const xml = this._buildMpd(item, req.headers.host || `127.0.0.1:${this.port}`);
+      res.writeHead(200, {
+        'Content-Type': 'application/dash+xml',
+        'Content-Length': Buffer.byteLength(xml),
+        'Cache-Control': 'no-store',
+      });
+      return res.end(xml);
+    }
+
     const m = /^\/s\/([a-f0-9]{16,64})\.mp4$/.exec(path);
     if (!m) {
       this.denied++;
@@ -109,6 +153,47 @@ class StreamProxy {
 
     this.hits++;
     this._forward(item.url, req, res, 0);
+  }
+
+  /** 生成 MPD：SegmentBase + indexRange，播放器可以直接按字节区间拖动 */
+  _buildMpd(item, host) {
+    const { video, audio, duration } = item.dash;
+    // host 可能已经带端口（请求头里的 Host）
+    const base = host.includes(':') ? `http://${host}` : `http://${host}:${this.port}`;
+    const vUrl = `${base}/s/${item.videoToken}.mp4`;
+    const aUrl = `${base}/s/${item.audioToken}.mp4`;
+    const dur = Math.max(1, Number(duration) || 0);
+    const iso = `PT${dur}S`;
+
+    const segBase = (s) => {
+      const idx = String(s.indexRange || '').trim();
+      const init = String(s.initRange || '').trim();
+      if (!idx) return '';
+      return `<SegmentBase indexRange="${idx}">${init ? `<Initialization range="${init}"/>` : ''}</SegmentBase>`;
+    };
+
+    const vCodec = video.codecs || 'avc1.640028';
+    const aCodec = audio.codecs || 'mp4a.40.2';
+    const vRs = video.width && video.height ? ` width="${video.width}" height="${video.height}" maxWidth="${video.width}" maxHeight="${video.height}"` : '';
+    const fps = video.frameRate ? ` frameRate="${String(video.frameRate).replace('/', '/')}"` : '';
+
+    return `<?xml version="1.0" encoding="utf-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" mediaPresentationDuration="${iso}" minBufferTime="PT1.5S" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011">
+  <Period duration="${iso}">
+    <AdaptationSet contentType="video" mimeType="video/mp4" segmentAlignment="true" startWithSAP="1"${vRs}${fps}>
+      <Representation id="v" bandwidth="${video.bandwidth || 2000000}" codecs="${vCodec}"${vRs}${fps}>
+        <BaseURL>${vUrl}</BaseURL>
+        ${segBase(video)}
+      </Representation>
+    </AdaptationSet>
+    <AdaptationSet contentType="audio" mimeType="audio/mp4" segmentAlignment="true" lang="und">
+      <Representation id="a" bandwidth="${audio.bandwidth || 132000}" codecs="${aCodec}" audioSamplingRate="44100">
+        <BaseURL>${aUrl}</BaseURL>
+        ${segBase(audio)}
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>`;
   }
 
   _forward(target, req, res, redirects) {

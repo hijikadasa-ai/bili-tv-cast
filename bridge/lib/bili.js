@@ -425,6 +425,26 @@ async function fetchPlayUrl(input) {
   const lines = [];
   const cands = [];
 
+  // 0) 用户明确要 1080P 且合并流拿不到时，走 DASH（音视频分轨，交给本机合流/直发）
+  if (input.preferDash) {
+    try {
+      const dash = await fetchDashStreams(input, want || 80);
+      return {
+        url: '',
+        dash,
+        qn: dash.video.id,
+        source: 'dash',
+        timelength: dash.duration * 1000,
+        needsProxy: false,
+        accept: [],
+        lines: [{ source: 'dash', qn: dash.video.id }],
+      };
+    } catch (err) {
+      tried.push(`dash（${err.message}）`);
+      lines.push({ source: 'dash', qn: 0, err: err.message });
+    }
+  }
+
   // 1) html5 线路：地址免鉴权，登录后 high_quality=1 可到 1080P
   try {
     const r = await fetchPlayUrlViaHtml5(input, cid, want || 80);
@@ -796,6 +816,65 @@ async function fetchPlayUrlViaTv(input, cid, qn) {
   };
 }
 
+/** 取 DASH 分轨（音视频分离）：新视频的 1080P 只存在这里 */
+async function fetchDashStreams(input, wantQn) {
+  const cid = Number(input.cid) || 0;
+  if (!cid) throw new Error('缺少 cid');
+  const q = {
+    cid: String(cid),
+    qn: String(wantQn || 80),
+    fnval: '16',
+    fnver: '0',
+    fourk: '1',
+    platform: 'pc',
+  };
+  if (input.epId) q.ep_id = String(input.epId);
+  if (input.bvid) q.bvid = String(input.bvid);
+  else if (input.aid) q.avid = String(input.aid);
+
+  const keys = await getWbiKeys();
+  const json = await getJson(
+    `https://api.bilibili.com/x/player/wbi/playurl?${wbiSign(q, wbiMixinKey(keys))}`,
+    { headers: cookieHeaders(input.cookie) }
+  );
+  if (json.code !== 0 || !json.data) throw new Error(json.message || `code ${json.code}`);
+  const d = json.data;
+  if (!d.dash) throw new Error('接口没有返回 DASH 流');
+
+  const norm = (s) => {
+    if (!s) return null;
+    const url = s.baseUrl || s.base_url || '';
+    if (!url) return null;
+    const sb = s.segment_base || s.segmentBase || {};
+    return {
+      url,
+      backup: (s.backupUrl || s.backup_url || [])[0] || '',
+      id: Number(s.id) || 0,
+      codecid: Number(s.codecid) || 0,
+      codecs: s.codecs || '',
+      bandwidth: Number(s.bandwidth) || 0,
+      width: Number(s.width) || 0,
+      height: Number(s.height) || 0,
+      frameRate: s.frameRate || s.frame_rate || '',
+      mimeType: s.mimeType || s.mime_type || '',
+      initRange: sb.initialization || '',
+      indexRange: sb.index_range || sb.indexRange || '',
+    };
+  };
+
+  const videos = (d.dash.video || []).map(norm).filter(Boolean);
+  const audios = (d.dash.audio || []).map(norm).filter(Boolean);
+  if (!videos.length || !audios.length) throw new Error('DASH 流不完整');
+
+  // 电视兼容性：优先 AVC(H.264)，同编码取清晰度最高
+  const avc = videos.filter((v) => v.codecid === 7);
+  const pool = avc.length ? avc : videos;
+  const video = pool.sort((a, b) => b.id - a.id)[0];
+  const audio = audios.sort((a, b) => b.id - a.id)[0];
+
+  return { video, audio, duration: Math.round((Number(d.timelength) || 0) / 1000) };
+}
+
 /** 只取合并流（durl）；dash 是纯视频轨，电视播了没声音，不要 */
 function pickDurl(data) {
   if (Array.isArray(data.durl) && data.durl.length && data.durl[0] && data.durl[0].url) {
@@ -809,6 +888,7 @@ module.exports = {
   resolveBangumi,
   fetchDanmaku,
   fetchPlayUrl,
+  fetchDashStreams,
   fetchFallbackStream,
   isPlayableStreamUrl,
   parseDanmakuXml,

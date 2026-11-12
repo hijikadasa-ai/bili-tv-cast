@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "小电视投屏 · B站协议",
-  "version": "1.3.4",
+  "version": "1.3.5",
   "description": "用 B 站私有协议（NVA / 哔哩必连）把网页视频投到云视听小电视，并在电视上同步滚动弹幕。网页右下角悬浮球可一键投屏。",
   "permissions": ["storage", "activeTab", "scripting", "cookies"],
   "host_permissions": ["*://*.bilibili.com/*"],

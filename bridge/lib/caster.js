@@ -258,14 +258,7 @@ class Caster extends EventEmitter {
 
     // 2) 拉播放地址
     this._log('info', '正在获取播放地址…');
-    const stream = await bili.fetchPlayUrl({
-      aid: video.aid,
-      bvid: video.bvid,
-      cid: video.cid,
-      epId: video.epid || video.epId || 0,
-      cookie: this.accessCookie,
-      qn: this.requestedQn,
-    });
+    const stream = await this._fetchStream(this.requestedQn);
     this.stream = stream;
     this.quality = stream.qn;
     this.qualities = stream.accept && stream.accept.length ? stream.accept : [];
@@ -295,12 +288,70 @@ class Caster extends EventEmitter {
   }
 
   /**
+   * 拉播放地址：先要合并流（单文件，最稳）；目标 ≥1080P 而合并流只给到
+   * 720P 时，改走 DASH 分轨——B 站新视频的高分辨率只存在 DASH 里。
+   */
+  async _fetchStream(want) {
+    const video = this.video || {};
+    const input = {
+      aid: video.aid,
+      bvid: video.bvid,
+      cid: video.cid,
+      epId: video.epid || video.epId || 0,
+      cookie: this.accessCookie,
+      qn: want,
+    };
+
+    let stream = await bili.fetchPlayUrl(input);
+    const target = Number(want) || 0;
+    const forceDash = process.env.BILI_FORCE_DASH === '1';
+    if (target < 80 || (stream.qn >= target && !forceDash)) return stream;
+
+    try {
+      const dash = await bili.fetchDashStreams(input, target);
+      // 分轨清晰度不比合并流高就没必要折腾（未登录时 DASH 只给 480P）
+      if (!forceDash && dash.video.id <= stream.qn) return stream;
+      this._log(
+        'info',
+        `合并流最高只有 ${qualityLabel(this.qualities, stream.qn)}，改用 DASH 分轨（${dash.video.width}x${dash.video.height}）`
+      );
+      return {
+        url: '',
+        dash,
+        qn: dash.video.id,
+        source: 'dash',
+        timelength: dash.duration * 1000,
+        needsProxy: false,
+        accept: stream.accept || [],
+        lines: [...(stream.lines || []), { source: 'dash', qn: dash.video.id }],
+      };
+    } catch (err) {
+      this._log('warn', `DASH 分轨不可用：${err.message}`);
+      return stream;
+    }
+  }
+
+  /**
    * 把流地址转成电视能直接请求的地址。
    *
    * pc 线路的地址带 Referer 防盗链，电视裸连会 403（「加载失败」）；
    * 这类地址登记到本机转发服务，改给电视一个本机地址，由桥接补 Referer 去取。
    */
   _playUrlFor(stream) {
+    if (stream && stream.dash) {
+      if (!this.proxy || !this.proxy.running) throw new Error('本机转发未就绪，无法播放 DASH');
+      const host = this._lanIpForDevice();
+      if (!host) throw new Error('没找到局域网地址，无法播放 DASH');
+      if (this._playUrlCache && this._playUrlCache.key === stream.dash.video.url) {
+        return this._playUrlCache.url;
+      }
+      const token = this.proxy.registerDash(stream.dash, { qn: stream.qn });
+      const url = this.proxy.mpdFor(host, token);
+      this._playUrlCache = { key: stream.dash.video.url, url };
+      this._log('info', `DASH 清单已生成，电视直连本机 ${host}:${this.proxy.port}`);
+      return url;
+    }
+
     if (!stream || !stream.url) throw new Error('没有可用的播放地址');
     if (!stream.needsProxy) return stream.url;
 
@@ -467,14 +518,7 @@ class Caster extends EventEmitter {
     this._switching = true;
     try {
       this._log('info', '正在获取新的清晰度地址…');
-      const stream = await bili.fetchPlayUrl({
-        aid: this.video.aid,
-        bvid: this.video.bvid,
-        cid: this.video.cid,
-        epId: this.video.epid || this.video.epId || 0,
-        cookie: this.accessCookie,
-        qn: target,
-      });
+      const stream = await this._fetchStream(target);
 
       if (!this.client || this._stoppedByUser) return this.snapshot();
 
