@@ -1083,9 +1083,26 @@ function pickVideoTrack(videos, wantQn, opts = {}) {
   const within = cap ? pool.filter((v) => v.id <= cap) : pool;
   const usable = within.length ? within : pool;
   const maxId = Math.max(...usable.map((v) => v.id));
+
+  // 4K 及以上：电视硬件解不了 High Profile L5.2 的 4K H.264（实测
+  // ff_video_dec fail ret:-100 codec_id:27，拉了 68MB 也出不了画面），
+  // 必须优先 H.265；1080P 及以下反过来 H.264 兼容性最好。
+  const needHevc = maxId >= 112;
+  const avcLevel = (v) => {
+    const m = String(v.codecs || '').match(/([0-9A-Fa-f]{2})$/);
+    return m ? parseInt(m[1], 16) : 0; // avc1.640034 → 0x34 = Level 5.2
+  };
+  const rank = (v) => {
+    if (v.codecid === CODEC_HEVC) return needHevc ? 4 : 2;
+    if (v.codecid === CODEC_AVC || !v.codecid) {
+      // H.264 规格超过 Level 5.1 的（只有 4K 轨会这样），电视多半解不了
+      return avcLevel(v) >= 0x33 ? (needHevc ? 1 : 3) : 3;
+    }
+    return 0;
+  };
   const same = usable
     .filter((v) => v.id === maxId)
-    .sort((a, b) => (CODEC_RANK[b.codecid] || 0) - (CODEC_RANK[a.codecid] || 0));
+    .sort((a, b) => rank(b) - rank(a) || b.bandwidth - a.bandwidth);
   return same[0] || null;
 }
 

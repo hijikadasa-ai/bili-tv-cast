@@ -30,7 +30,7 @@ const PORT = Number(process.env.BILI_CAST_PORT || 8787);
 const PROXY_PORT = Number(process.env.BILI_CAST_PROXY_PORT || 8790);
 const HOST = '127.0.0.1';
 const VERSION = '1.0.0';
-const BUILD = '1.4.2';
+const BUILD = '1.4.3';
 const SERVICE = 'bili-tv-cast';
 
 // 流转发：pc 线路的地址有 Referer 防盗链，电视裸连会 403，需要本机代取
@@ -187,7 +187,7 @@ function localGet(path, range, timeout = 20000) {
 }
 
 async function runSelfTest(res, bvid, qn, allowHevc) {
-  const out = { bvid, qn, allowHevc, cookie: false, login: null, accept: [], dash: null, mpd: null, first: null, mid: null };
+  const out = { bvid, qn, allowHevc, cookie: false, login: null, accept: [], dash: null, master: null, videoPl: null, seg0: null };
   try {
     const cookie = readCachedCookie();
     out.cookie = Boolean(cookie);
@@ -217,12 +217,23 @@ async function runSelfTest(res, bvid, qn, allowHevc) {
       duration: dash.duration,
       avcMax: dash.avcMax,
     };
-    const token = proxy.registerDash(dash, { qn: dash.video.id });
+    // DASH 现在包装成本机 HLS（电视实测只认 HLS，不认 MPD）
+    const token = proxy.registerHls(dash, { qn: dash.video.id });
     const item = proxy.routes.get(token);
-    out.mpd = await localGet(`/mpd/${token}.mp4`);
-    const vPath = `/s/${item.videoToken}.mp4`;
-    out.first = await localGet(vPath, 'bytes=0-2047999');
-    out.healthy = Boolean(out.mpd && out.mpd.status === 200 && out.first && out.first.status === 206 && out.first.bytes > 100000);
+    await item._ready; // 等 sidx 解析 / 分段表生成
+    out.master = await localGet(`/hls/${token}.m3u8`);
+    out.videoPl = await localGet(`/hls/${token}/video.m3u8`);
+    out.seg0 = await localGet(`/hls/${token}/v/0.m4s`);
+    out.healthy =
+      Boolean(
+        out.master &&
+          out.master.status === 200 &&
+          out.videoPl &&
+          out.videoPl.status === 200 &&
+          out.seg0 &&
+          out.seg0.status === 200 &&
+          out.seg0.bytes > 100000
+      );
     return json(res, 200, out);
   } catch (err) {
     out.error = err.message;

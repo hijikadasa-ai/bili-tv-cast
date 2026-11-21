@@ -71,6 +71,10 @@ class Caster extends EventEmitter {
     this.playState = 0;
     this.volume = 50;
     this.lastPos = 0;
+    // 电视进度回报跟踪：HLS 播放下部分固件在 seek 后会把 OnProgress 冻在
+    // 跳转目标不动（画面在播、进度不涨），这时要靠本地时钟推算进度
+    this._reportPos = 0;
+    this._lastMoveAt = 0;
 
     this._timer = null;
     this._watchdog = null;
@@ -396,10 +400,13 @@ class Caster extends EventEmitter {
       if (this._playUrlCache && this._playUrlCache.key === stream.dash.video.url) {
         return this._playUrlCache.url;
       }
-      const token = this.proxy.registerDash(stream.dash, { qn: stream.qn });
-      const url = this.proxy.mpdFor(host, token);
+      // DASH 分轨包装成本机 HLS（master + 每段独立 URL）。
+      // 实测电视端的播放器是 ffmpeg，原生吃 HLS；而 MPD/DASH 清单它不认。
+      // sidx 解析出分段表后按段转发，电视端逐段拉流，1080P/4K 都稳定。
+      const token = this.proxy.registerHls(stream.dash, { qn: stream.qn });
+      const url = this.proxy.hlsFor(host, token);
       this._playUrlCache = { key: stream.dash.video.url, url };
-      this._log('info', `DASH 清单已生成，电视直连本机 ${host}:${this.proxy.port}`);
+      this._log('info', `HLS 清单已生成（qn=${stream.qn}），电视直连本机 ${host}:${this.proxy.port}`);
       return url;
     }
 
@@ -576,6 +583,10 @@ class Caster extends EventEmitter {
     };
 
     const base = this._playUrlFor(stream);
+    if (this._resendTimer) {
+      clearTimeout(this._resendTimer);
+      this._resendTimer = null;
+    }
     const sep = base.includes('?') ? '&' : '?';
     const url = base + sep + 'nva_ext=' + encodeURIComponent(JSON.stringify({ ver: 2, content }));
     // 官方流程是先 Stop 再设置地址：上一次失败的会话会把播放器卡在「缓冲中」，
@@ -588,13 +599,35 @@ class Caster extends EventEmitter {
     };
     if (process.env.BILI_STOP_FIRST !== '0') {
       this.client.sendCommand('Stop');
-      // 停掉上一次会话后给电视一点时间回到接收页，再塞新地址
+      // 停掉上一次会话后给电视一点时间回到接收页，再塞新地址。
+      // 解码失败后的重发要留更久：播放器销毁得更慢
+      const gap = Number(this._stopGapMs) || 450;
+      this._stopGapMs = 0;
       setTimeout(() => {
         if (this.client) issue();
-      }, 450);
+      }, gap);
     } else {
       issue();
     }
+    // 兜底：如果电视在 6 秒内连清单都没来取，多半是刚才那次失败把
+    // 接收页卡住了，再补发一次（Stop → 稍等 → PlayUrl）
+    const stats0 = this.proxy ? this.proxy.snapshot() : null;
+    const pl0 = stats0 ? (Number(stats0.mpdHits) || 0) + (Number(stats0.hlsHits) || 0) : 0;
+    this._resendTimer = setTimeout(() => {
+      if (!this.client || this._stoppedByUser || this.state !== 'casting') return;
+      const stats = this.proxy ? this.proxy.snapshot() : null;
+      const pl = stats ? (Number(stats.mpdHits) || 0) + (Number(stats.hlsHits) || 0) : 0;
+      if (pl > pl0) return;
+      this._log('warn', '电视没来取清单，自动补发一次播放指令…');
+      this.client.sendCommand('Stop');
+      setTimeout(() => {
+        if (this.client && !this._stoppedByUser) {
+          this.client.sendCommand('PlayUrl', { url, title: video.title || '' });
+          this._playIssuedAt = Date.now();
+        }
+      }, 900);
+    }, 6000);
+    if (this._resendTimer.unref) this._resendTimer.unref();
     // 部分固件只认「PlayUrl 之后再补一条 Play」才会真正起播
     // （只发 PlayUrl 时表现为：取了几百 KB 就停住、电视一直显示 0 网速）
     if (process.env.BILI_SEND_PLAY === '1') {
@@ -752,6 +785,10 @@ class Caster extends EventEmitter {
     this._stoppedByUser = true;
     this._stopTicker();
     this._clearWatchdog();
+    if (this._resendTimer) {
+      clearTimeout(this._resendTimer);
+      this._resendTimer = null;
+    }
     this._pendingSeek = 0;
     if (this._danmakuRetry) {
       clearTimeout(this._danmakuRetry);
@@ -786,7 +823,10 @@ class Caster extends EventEmitter {
     // 记下此刻的转发字节数：下一次看门狗触发时用它判断电视是否真的在消费数据
     this._watchBytesBase = this.proxy ? Number(this.proxy.snapshot().bytes) || 0 : 0;
     this._watchArmedAt = Date.now();
-    this._watchdog = setTimeout(() => this._onWatchdog(), WATCHDOG_MS);
+    // 4K 每段 10MB 上下、起播缓冲慢得多，看门狗给双倍时间，
+    // 否则还没缓冲完就被误判「没播起来」降档到 1080P
+    const ms = (this.quality || 0) >= 112 ? WATCHDOG_MS * 2 : WATCHDOG_MS;
+    this._watchdog = setTimeout(() => this._onWatchdog(), ms);
     if (this._watchdog.unref) this._watchdog.unref();
   }
 
@@ -807,7 +847,8 @@ class Caster extends EventEmitter {
 
     const attempt = this._watchdogAttempts || 0;
     const stats = (this.proxy && typeof this.proxy.snapshot === 'function' && this.proxy.snapshot()) || {};
-    const mpdHits = Number(stats.mpdHits) || 0;
+    const mpdHits =
+      (Number(stats.mpdHits) || 0) + (Number(stats.hlsHits) || 0);
     const segHits = Number(stats.segHits) || 0;
     const isDash = Boolean(this.stream && this.stream.source === 'dash');
 
@@ -849,6 +890,7 @@ class Caster extends EventEmitter {
       this.qualityNote = note || this._codecNote(stream);
       this._playUrlCache = null;
       this.playState = PLAY_STATE.LOADING;
+      this._stopGapMs = 1200; // 刚失败过，播放器需要更长的销毁时间
       this._sendPlayUrl(stream, this.position);
       this._pendingSeek = this.position > 3 ? this.position : 0;
       this._seekTries = 0;
@@ -878,15 +920,21 @@ class Caster extends EventEmitter {
       return;
     }
 
-    // 2) H.265 / 高码率分轨电视解不了：退回 H.264 最高档
-    //    这是「有进度条但 0 网速」最常见的原因：电视芯片不支持 10bit H.265
+    // 2) 电视解不了当前分轨：H.265 → 切回 H.264；4K 的 H.264（规格过高）→ 降回 1080P
+    //    「拉了数据但 0 进度」最常见的原因：电视芯片不支持这颗流的规格
     if (attempt <= 1 && isDash && (Number(this.stream.codec) === 12 || Number(this.stream.qn) >= 112)) {
       this._watchdogAttempts = 2;
-      run('切回 H.264', async () => {
+      run('切换可解码轨道', async () => {
         const from = codecName(this.stream.codec) || qualityLabel(this.qualities, this.stream.qn);
-        this._log('warn', `${from} 分轨电视解不了，正在切回 H.264…`);
+        const isHevc = Number(this.stream.codec) === 12;
+        this._log(
+          'warn',
+          isHevc
+            ? `${from} 分轨电视解不了，正在切回 H.264…`
+            : `${qualityLabel(this.qualities, this.stream.qn)} 的 H.264 规格电视解不了（4K H.264 需 Level 5.2），正在降回 1080P…`
+        );
         const stream = await this._fetchStream(80, '', false, { allowHevc: false, allowLower: true });
-        apply(stream, `电视解不了 ${from}，已切回 ${qualityLabel(this.qualities, stream.qn)}（H.264）`);
+        apply(stream, `电视解不了 ${from}，已改用 ${qualityLabel(this.qualities, stream.qn)}（H.264）`);
       });
       return;
     }
@@ -956,8 +1004,16 @@ class Caster extends EventEmitter {
         const dur = Number(params && params.duration) || 0;
         if (dur > 0 && pos > 0) this._clearWatchdog();
         this._lastReportAt = Date.now();
-        this._localClock = { at: Date.now(), pos };
-        this._onProgress(pos, dur);
+        // 进度值真的变了才重置本地时钟；冻住时保留旧基线给 _tick 推算用
+        const moved = Math.abs(pos - this._reportPos) > 0.01;
+        this._reportPos = pos;
+        if (moved || !this._lastMoveAt) this._lastMoveAt = Date.now();
+        if (moved || !this._localClock) this._localClock = { at: Date.now(), pos };
+        // 进度冻住（画面在播、回报值一直不变）时忽略回报值：
+        // 每秒都把进度拽回跳转目标会让弹幕反复重新对齐，交给 _tick 本地推算
+        const frozen =
+          this.playState === PLAY_STATE.PLAYING && Date.now() - (this._lastMoveAt || 0) > 8000;
+        if (!frozen) this._onProgress(pos, dur);
         this._ack(counter);
         break;
       }
@@ -1126,11 +1182,13 @@ class Caster extends EventEmitter {
   }
 
   _tick() {
-    // 电视不回传 OnProgress 时（部分固件），用本地时钟估算进度让面板/弹幕跟得上
+    // 电视不回传 OnProgress 时（部分固件），用本地时钟估算进度让面板/弹幕跟得上；
+    // HLS 播放下电视可能在 seek 后每秒都回报同一个进度值（进度冻结），
+    // 所以判断条件是「进度值 8 秒没动」而不是「8 秒没有回报」
     if (
       this.playState === PLAY_STATE.PLAYING &&
       this._localClock &&
-      (!this._lastReportAt || Date.now() - this._lastReportAt > 8000)
+      Date.now() - (this._lastMoveAt || 0) > 8000
     ) {
       const est = this._localClock.pos + (Date.now() - this._localClock.at) / 1000;
       if (!this.duration || est < this.duration + 5) {

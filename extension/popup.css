@@ -524,7 +524,7 @@ body {
 .ver-line {
   margin: 8px 2px 4px;
   font-size: 11px;
-  color: var(--muted, #8a8f98);
+  color: var(--ink-3);
   text-align: right;
   letter-spacing: 0.2px;
 }
