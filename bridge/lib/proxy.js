@@ -42,6 +42,11 @@ class StreamProxy {
     this.hits = 0;
     this.bytes = 0;
     this.denied = 0;
+    this.mpdHits = 0; // 电视来取清单的次数（0 = 它根本没来拿）
+    this.segHits = 0; // 电视来取分片的次数（>0 才说明清单被接受了）
+    this.lastClient = '';
+    this.lastRange = '';
+    this.trace = []; // 最近若干条请求，排查「电视到底卡在哪一步」用
     this.lastSpeed = 0; // KB/s，最近一次采样
     this._lastBytes = 0;
     this._lastActiveAt = 0;
@@ -88,7 +93,65 @@ class StreamProxy {
       expires: Date.now() + TTL_MS,
       ...meta,
     });
+    // H.265 分轨：后台取一次初始化段，把 hev1 改成 hvc1（见 _prepareHevcInit）
+    this._prepareHevcInit(this.routes.get(videoToken), dash.video).catch(() => {});
     return token;
+  }
+
+  /**
+   * 很多电视/机顶盒的播放器只认 `hvc1`（参数集在 hvcC 里），
+   * 而 B 站 H.265 分轨的初始化段写的是 `hev1`，会被直接判为不支持的格式
+   * ——表现就是「连上了但 0 网速」。这里提前取回初始化段，把 box 名改掉后
+   * 由本机直接应答，字节数完全一致，后面的分片不受影响。
+   */
+  async _prepareHevcInit(item, track) {
+    const v = track;
+    if (!item || !v || Number(v.codecid) !== 12) return;
+    const m = /^(\d+)-(\d+)$/.exec(String(v.initRange || '').trim());
+    if (!m) return;
+    const start = Number(m[1]);
+    const end = Number(m[2]);
+    if (!(end > start) || end - start > 4 * 1024 * 1024) return;
+
+    const u = new URL(v.url);
+    const lib = u.protocol === 'https:' ? https : http;
+    const buf = await new Promise((resolve) => {
+      const req = lib.request(
+        {
+          hostname: u.hostname,
+          port: u.port || (u.protocol === 'https:' ? 443 : 80),
+          path: u.pathname + u.search,
+          method: 'GET',
+          headers: {
+            'User-Agent': UA,
+            Referer: REFERER,
+            Range: `bytes=${start}-${end}`,
+          },
+        },
+        (res) => {
+          if (res.statusCode !== 200 && res.statusCode !== 206) {
+            res.resume();
+            resolve(null);
+            return;
+          }
+          const total = Number(String(res.headers['content-range'] || '').split('/')[1]) || 0;
+          const chunks = [];
+          res.on('data', (c) => chunks.push(c));
+          res.on('end', () => resolve({ buf: Buffer.concat(chunks), total }));
+        }
+      );
+      req.setTimeout(8000, () => req.destroy(new Error('超时')));
+      req.on('error', () => resolve(null));
+      req.end();
+    });
+    if (!buf || !buf.buf.length) return;
+
+    const patched = Buffer.from(buf.buf);
+    const idx = patched.indexOf(Buffer.from('hev1', 'latin1'));
+    if (idx < 0) return;
+    patched.write('hvc1', idx, 'latin1');
+    item.initPatched = { start, end, buf: patched, total: buf.total || 0 };
+    this._note('H.265 初始化段已改写 hvc1');
   }
 
   /** 给电视用的 MPD 地址（部分播放器只认 .mp4 后缀，两种都留） */
@@ -161,7 +224,19 @@ class StreamProxy {
       routes: this.routes.size,
       hits: this.hits,
       kbps: this.lastSpeed,
+      mpdHits: this.mpdHits,
+      segHits: this.segHits,
+      bytes: this.bytes,
+      lastClient: this.lastClient,
+      lastRange: this.lastRange,
+      trace: this.trace.slice(-12),
     };
+  }
+
+  /** 记一条请求摘要（只留最近 40 条，避免占内存） */
+  _note(msg) {
+    this.trace.push(`${new Date().toTimeString().slice(0, 8)} ${msg}`);
+    if (this.trace.length > 40) this.trace.shift();
   }
 
   _gc() {
@@ -182,6 +257,11 @@ class StreamProxy {
         res.writeHead(410, { 'Content-Type': 'text/plain; charset=utf-8' });
         return res.end('mpd expired');
       }
+      this.mpdHits++;
+      this.lastClient = `${req.socket.remoteAddress || ''} ${req.headers['user-agent'] || ''}`.trim();
+      this._note(`取清单 qn=${item.qn || '?'} ← ${req.socket.remoteAddress || '?'}`);
+      const missIdx = !(item.dash.video.indexRange && item.dash.audio.indexRange);
+      if (missIdx) this.onLog('warn', '清单里缺分片索引（indexRange），电视可能一直 0 网速');
       const xml = this._buildMpd(item, req.headers.host || `127.0.0.1:${this.port}`);
       res.writeHead(200, {
         'Content-Type': 'application/dash+xml',
@@ -209,7 +289,38 @@ class StreamProxy {
       return res.end('stream url expired');
     }
 
+    // H.265 初始化段直接从内存回（已把 hev1 改成 hvc1）
+    if (item.initPatched) {
+      const r = /^bytes=(\d+)-(\d*)$/.exec(String(req.headers.range || ''));
+      if (r) {
+        const s = Number(r[1]);
+        const e = r[2] ? Number(r[2]) : item.initPatched.end;
+        if (e >= s && s >= item.initPatched.start && e <= item.initPatched.end) {
+          const slice = item.initPatched.buf.slice(s - item.initPatched.start, e - item.initPatched.start + 1);
+          const total = item.initPatched.total || item.initPatched.end + 1;
+          this.hits++;
+          this.segHits++;
+          this.lastRange = req.headers.range;
+          res.writeHead(206, {
+            'Content-Type': 'video/mp4',
+            'Accept-Ranges': 'bytes',
+            'Content-Range': `bytes ${s}-${e}/${total}`,
+            'Content-Length': slice.length,
+            'Cache-Control': 'no-store',
+          });
+          return res.end(req.method === 'HEAD' ? undefined : slice);
+        }
+      }
+    }
+
     this.hits++;
+    this.segHits++;
+    this.lastRange = req.headers.range || '整段';
+    if (!item._loggedFirstGet) {
+      item._loggedFirstGet = true;
+      this.onLog('info', `电视开始取流（${item.kind || 'stream'}，${this.lastRange}）`);
+      this._note(`取流 ${item.kind || ''} ${this.lastRange} ← ${req.socket.remoteAddress || '?'}`);
+    }
     this._forward(item, req, res, 0, 0);
   }
 
@@ -230,22 +341,42 @@ class StreamProxy {
       return `<SegmentBase indexRange="${idx}">${init ? `<Initialization range="${init}"/>` : ''}</SegmentBase>`;
     };
 
-    const vCodec = video.codecs || 'avc1.640028';
-    const aCodec = audio.codecs || 'mp4a.40.2';
-    const vRs = video.width && video.height ? ` width="${video.width}" height="${video.height}" maxWidth="${video.width}" maxHeight="${video.height}"` : '';
-    const fps = video.frameRate ? ` frameRate="${String(video.frameRate).replace('/', '/')}"` : '';
+    // 有些电视播放器只认 hvc1，不认 hev1（两者都是 H.265，只是参数集位置不同）
+    const codecOf = (s, fallback) => {
+      const c = String(s.codecs || '').trim();
+      if (!c) return fallback;
+      return c.replace(/^hev1/i, 'hvc1');
+    };
+
+    // frameRate 只接受整数或 "a/b" 比例；"29.970" 这种小数有些解析器会直接报错
+    const fpsOf = (raw) => {
+      const s = String(raw || '').trim();
+      if (/^\d+$/.test(s)) return s;
+      if (/^\d+\/\d+$/.test(s)) return s;
+      if (/^\d+\.\d+$/.test(s)) {
+        const n = Number(s);
+        if (isFinite(n) && n > 0) return `${Math.round(n * 1000)}/1000`;
+      }
+      return '';
+    };
+    const fpsText = fpsOf(video.frameRate);
+    const fps = fpsText ? ` frameRate="${fpsText}"` : '';
+    const size =
+      video.width && video.height
+        ? ` width="${video.width}" height="${video.height}"`
+        : '';
 
     return `<?xml version="1.0" encoding="utf-8"?>
-<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" mediaPresentationDuration="${iso}" minBufferTime="PT2S" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011">
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" mediaPresentationDuration="${iso}" minBufferTime="PT1.5S" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011">
   <Period duration="${iso}">
-    <AdaptationSet contentType="video" mimeType="video/mp4" segmentAlignment="true" startWithSAP="1"${vRs}${fps}>
-      <Representation id="v" bandwidth="${video.bandwidth || 2000000}" codecs="${vCodec}"${vRs}${fps}>
+    <AdaptationSet contentType="video" mimeType="video/mp4" segmentAlignment="true" startWithSAP="1"${size}${fps}>
+      <Representation id="v" bandwidth="${video.bandwidth || 2000000}" codecs="${codecOf(video, 'avc1.640028')}"${size}${fps} sar="1:1">
         <BaseURL>${vUrl}</BaseURL>
         ${segBase(video)}
       </Representation>
     </AdaptationSet>
     <AdaptationSet contentType="audio" mimeType="audio/mp4" segmentAlignment="true" lang="und">
-      <Representation id="a" bandwidth="${audio.bandwidth || 132000}" codecs="${aCodec}" audioSamplingRate="48000">
+      <Representation id="a" bandwidth="${audio.bandwidth || 132000}" codecs="${codecOf(audio, 'mp4a.40.2')}" startWithSAP="1">
         <BaseURL>${aUrl}</BaseURL>
         ${segBase(audio)}
       </Representation>
@@ -331,10 +462,19 @@ class StreamProxy {
           item.url = target;
         }
 
+        // 分轨固定用视频/音频类型：B 站 m4s 常回 application/octet-stream，
+        // 严格的电视播放器会因此拒绝解码。
+        const forced = item.kind === 'dash-audio' ? 'audio/mp4' : item.kind === 'dash-video' ? 'video/mp4' : '';
         const out = { 'Accept-Ranges': 'bytes', 'Cache-Control': 'no-store' };
-        if (ur.headers['content-type']) out['Content-Type'] = ur.headers['content-type'];
+        const ct = forced || ur.headers['content-type'] || '';
+        if (ct) out['Content-Type'] = ct;
         if (ur.headers['content-length']) out['Content-Length'] = ur.headers['content-length'];
         if (ur.headers['content-range']) out['Content-Range'] = ur.headers['content-range'];
+
+        if (!item._loggedFirstOk) {
+          item._loggedFirstOk = true;
+          this._note(`上游 ${code} ${u.hostname} ${ur.headers['content-length'] || ''}`);
+        }
 
         headerSent = true;
         res.writeHead(code, out);

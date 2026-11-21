@@ -326,10 +326,22 @@ const QN_LABEL = {
   112: '高码率 1080P+',
   116: '高清 1080P60',
   120: '超清 4K',
-  125: 'HDR',
+  125: '真彩 HDR',
   126: '杜比视界',
   127: '8K',
 };
+
+/**
+ * 电视播放器能认的编码，优先级从高到低。
+ * 7=H.264（最稳，几乎所有电视都支持）
+ * 12=H.265（多数新电视支持，但 10bit HDR 常常翻车）
+ * 13=AV1、14=杜比视界：老电视基本解不了，先排除
+ */
+const CODEC_AVC = 7;
+const CODEC_HEVC = 12;
+const CODEC_AV1 = 13;
+const CODEC_DV = 14;
+const CODEC_RANK = { 7: 3, 12: 2 };
 
 /**
  * 电视端播放器只认「普通 CDN 直链」：实测 B 站给未登录/网页端返回的
@@ -966,14 +978,127 @@ function pickAudioTrack(audios) {
   })[0];
 }
 
+/** 取一小段字节，用来检查分轨的文件结构 */
+function fetchRange(url, start, end, timeout = 6000) {
+  return new Promise((resolve) => {
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch (_) {
+      resolve(Buffer.alloc(0));
+      return;
+    }
+    const lib = parsed.protocol === 'https:' ? https : require('http');
+    const req = lib.request(
+      {
+        hostname: parsed.hostname,
+        port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+        path: parsed.pathname + parsed.search,
+        method: 'GET',
+        headers: {
+          'User-Agent': UA,
+          Referer: 'https://www.bilibili.com/',
+          Range: `bytes=${start}-${end}`,
+        },
+      },
+      (res) => {
+        if (res.statusCode !== 200 && res.statusCode !== 206) {
+          res.resume();
+          resolve(Buffer.alloc(0));
+          return;
+        }
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => resolve(Buffer.concat(chunks)));
+      }
+    );
+    req.setTimeout(timeout, () => req.destroy(new Error('超时')));
+    req.on('error', () => resolve(Buffer.alloc(0)));
+    req.end();
+  });
+}
+
+/** 扫一遍顶层 MP4 box，拿到 ftyp/moov/sidx 的字节区间 */
+function scanTopBoxes(buf) {
+  const out = [];
+  let off = 0;
+  while (off + 8 <= buf.length) {
+    let size = buf.readUInt32BE(off);
+    const type = buf.toString('latin1', off + 4, off + 8);
+    let header = 8;
+    if (size === 1) {
+      if (off + 16 > buf.length) break;
+      size = Number(buf.readBigUInt64BE(off + 8));
+      header = 16;
+    } else if (size === 0) {
+      out.push({ type, start: off, end: buf.length - 1 });
+      break;
+    }
+    if (size < header + 1 || off + size > buf.length) break;
+    out.push({ type, start: off, end: off + size - 1 });
+    off += size;
+  }
+  return out;
+}
+
+/**
+ * 补齐分轨的 initialization / index 区间。
+ * B 站一般直接给 segment_base，但个别清晰度只给空对象；这时清单里没有
+ * 分片信息，播放器会「连上了但一个字节都不取」——看着就是 0 网速。
+ * 这里自己读前 256KB 把 moov/sidx 找出来补上。
+ */
+async function repairSegmentBase(track) {
+  if (!track || (track.initRange && track.indexRange)) return track;
+  const head = await fetchRange(track.url, 0, 262143);
+  if (!head.length) return track;
+  const boxes = scanTopBoxes(head);
+  const ftyp = boxes.find((b) => b.type === 'ftyp');
+  const moov = boxes.find((b) => b.type === 'moov');
+  const sidx = boxes.find((b) => b.type === 'sidx');
+  if (!track.initRange && moov) {
+    track.initRange = `${ftyp ? ftyp.start : 0}-${moov.end}`;
+    track.repaired = true;
+  }
+  if (!track.indexRange && sidx) {
+    track.indexRange = `${sidx.start}-${sidx.end}`;
+    track.repaired = true;
+  }
+  return track;
+}
+
+/**
+ * 挑视频轨：先看用户要的那一档，同档位优先 H.264。
+ * allowHevc=false 时只用 H.264（电视解不了 H.265 时的保命选项）。
+ */
+function pickVideoTrack(videos, wantQn, opts = {}) {
+  const allowHevc = opts.allowHevc !== false;
+  let pool = videos.filter((v) => v.codecid !== CODEC_AV1 && v.codecid !== CODEC_DV);
+  if (!allowHevc) {
+    const avc = pool.filter((v) => v.codecid === CODEC_AVC || !v.codecid);
+    if (avc.length) pool = avc;
+  }
+  if (!pool.length) pool = videos.slice();
+
+  const cap = Number(wantQn) || 0;
+  const within = cap ? pool.filter((v) => v.id <= cap) : pool;
+  const usable = within.length ? within : pool;
+  const maxId = Math.max(...usable.map((v) => v.id));
+  const same = usable
+    .filter((v) => v.id === maxId)
+    .sort((a, b) => (CODEC_RANK[b.codecid] || 0) - (CODEC_RANK[a.codecid] || 0));
+  return same[0] || null;
+}
+
 /** 取 DASH 分轨（音视频分离）：新视频的 1080P 只存在这里 */
-async function fetchDashStreams(input, wantQn) {
+async function fetchDashStreams(input, wantQn, opts = {}) {
   const cid = Number(input.cid) || 0;
   if (!cid) throw new Error('缺少 cid');
   const q = {
     cid: String(cid),
     qn: String(wantQn || 80),
-    fnval: '16',
+    // 4048 = DASH(16) + 8K/HDR/杜比 等全部特性位：
+    // 用 16 时接口不会把「真彩 HDR」「杜比视界」放进清晰度列表
+    fnval: '4048',
     fnver: '0',
     fourk: '1',
     platform: 'pc',
@@ -1018,16 +1143,14 @@ async function fetchDashStreams(input, wantQn) {
   const audios = (d.dash.audio || []).map(norm).filter(Boolean);
   if (!videos.length || !audios.length) throw new Error('DASH 流不完整');
 
-  // 电视解码能力：优先 H.264；没有再用 H.265；AV1(13)、杜比视界(14) 老电视基本播不了
-  const avc = videos.filter((v) => v.codecid === 7);
-  const hevc = videos.filter((v) => v.codecid === 12);
-  const pool = avc.length ? avc : hevc.length ? hevc : videos.filter((v) => v.codecid !== 13 && v.codecid !== 14);
-  const usable = pool.length ? pool : videos;
-  const cap = Math.min(Number(wantQn) || 80, 120);
-  const under = usable.filter((v) => v.id <= cap);
-  const videoTrack = (under.length ? under : usable).sort((a, b) => b.id - a.id)[0];
+  const videoTrack = pickVideoTrack(videos, Number(wantQn) || 80, {
+    allowHevc: opts.allowHevc !== false,
+  });
   const audioTrack = pickAudioTrack(audios);
   if (!videoTrack || !audioTrack) throw new Error('DASH 流不完整');
+
+  // 个别清晰度不带 segment_base，清单会缺分片信息（电视会 0 网速），这里补齐
+  await Promise.all([repairSegmentBase(videoTrack), repairSegmentBase(audioTrack)]);
 
   // 每个分轨都有若干个 CDN 地址，实测挑最快的；其余留作转发层故障切换
   const [vpick, apick] = await Promise.all([
@@ -1035,10 +1158,17 @@ async function fetchDashStreams(input, wantQn) {
     pickFastestNode(audioTrack.urls, input.avoidHost),
   ]);
 
+  const maxOf = (cid) => Math.max(0, ...videos.filter((v) => v.codecid === cid).map((v) => v.id));
+
   return {
     video: { ...videoTrack, url: vpick.url, urls: vpick.candidates, host: vpick.host, speed: vpick.speed },
     audio: { ...audioTrack, url: apick.url, urls: apick.candidates, host: apick.host, speed: apick.speed },
     duration: Math.round((Number(d.timelength) || 0) / 1000),
+    // 接口这份才是完整清晰度表（html5 线路会少给 4K/HDR）
+    accept: normalizeAccept(d),
+    codec: videoTrack.codecid,
+    avcMax: maxOf(CODEC_AVC),
+    hevcMax: maxOf(CODEC_HEVC),
   };
 }
 

@@ -58,6 +58,35 @@
 
       <div class="setting-row">
         <div class="setting-text">
+          <div class="toggle-title">高清编码</div>
+          <div class="toggle-hint" id="codecHint">自动：优先 H.264，4K/HDR 才用 H.265</div>
+        </div>
+        <select id="codecMode" class="mini-select">
+          <option value="auto">自动</option>
+          <option value="avc">只用 H.264（最兼容）</option>
+        </select>
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-text">
+          <div class="toggle-title">默认清晰度</div>
+          <div class="toggle-hint">投屏时优先要这一档，能不能播取决于账号和电视</div>
+        </div>
+        <select id="defaultQn" class="mini-select">
+          <option value="0">自动（登录后 1080P）</option>
+          <option value="127">8K</option>
+          <option value="125">真彩 HDR</option>
+          <option value="120">超清 4K</option>
+          <option value="116">高清 1080P60</option>
+          <option value="112">高码率 1080P+</option>
+          <option value="80">高清 1080P</option>
+          <option value="64">高清 720P</option>
+          <option value="32">清晰 480P</option>
+        </select>
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-text">
           <div class="toggle-title">网页悬浮球</div>
           <div class="toggle-hint">B 站页面右下角，点一下就投屏</div>
         </div>

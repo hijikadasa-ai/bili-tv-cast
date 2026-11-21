@@ -13,6 +13,7 @@
  */
 
 const http = require('http');
+const fs = require('fs');
 const net = require('net');
 const os = require('os');
 const path = require('path');
@@ -29,7 +30,7 @@ const PORT = Number(process.env.BILI_CAST_PORT || 8787);
 const PROXY_PORT = Number(process.env.BILI_CAST_PROXY_PORT || 8790);
 const HOST = '127.0.0.1';
 const VERSION = '1.0.0';
-const BUILD = '1.3.6';
+const BUILD = '1.4.0';
 const SERVICE = 'bili-tv-cast';
 
 // 流转发：pc 线路的地址有 Referer 防盗链，电视裸连会 403，需要本机代取
@@ -41,10 +42,59 @@ let scanning = false;
 
 // ------------------------------------------------------------------ 日志
 
+const DATA_DIR = path.join(process.env.LOCALAPPDATA || os.homedir(), 'BiliTVCast');
+const LOG_DIR = path.join(DATA_DIR, 'logs');
+const LOG_FILE = path.join(LOG_DIR, 'bridge.log');
+const ACCOUNT_FILE = path.join(DATA_DIR, 'account.json');
+
+function ensureDir(dir) {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+// 日志超过 4MB 就归档一份，避免无限长大
+try {
+  ensureDir(LOG_DIR);
+  if (fs.existsSync(LOG_FILE) && fs.statSync(LOG_FILE).size > 4 * 1024 * 1024) {
+    fs.renameSync(LOG_FILE, path.join(LOG_DIR, 'bridge.old.log'));
+  }
+} catch (_) {
+  /* ignore */
+}
+
 function log(level, message) {
   const stamp = new Date().toLocaleTimeString('zh-CN', { hour12: false });
   const prefix = { info: '[信息]', warn: '[警告]', error: '[错误]' }[level] || '[日志]';
   console.log(`${stamp} ${prefix} ${message}`);
+  try {
+    fs.appendFileSync(LOG_FILE, `${stamp} ${prefix} ${message}\n`);
+  } catch (_) {
+    /* 写不了日志不影响投屏 */
+  }
+}
+
+/** 记住上次投屏用的登录凭证：调试和复投时不用再读一次浏览器 Cookie */
+function readCachedCookie() {
+  try {
+    const j = JSON.parse(fs.readFileSync(ACCOUNT_FILE, 'utf8'));
+    if (j && j.cookie && (!j.savedAt || Date.now() - j.savedAt < 30 * 86400000)) return String(j.cookie);
+  } catch (_) {
+    /* 没有缓存 */
+  }
+  return '';
+}
+
+function cacheCookie(cookie) {
+  if (!cookie || String(cookie).length < 20) return;
+  try {
+    ensureDir(DATA_DIR);
+    fs.writeFileSync(ACCOUNT_FILE, JSON.stringify({ cookie: String(cookie), savedAt: Date.now() }, null, 1));
+  } catch (_) {
+    /* ignore */
+  }
 }
 
 // ------------------------------------------------------------------ HTTP
@@ -239,11 +289,19 @@ async function handleMessage(conn, raw) {
         };
 
         log('info', `投屏：${video.title} ${video.partTitle || ''}（aid=${video.aid} cid=${video.cid}）`);
+        const cookieFromPage = String(payload.cookie || '');
+        if (cookieFromPage) cacheCookie(cookieFromPage);
+        const cookie = cookieFromPage || readCachedCookie();
+        log(
+          'info',
+          cookie ? '已带登录凭证（可拉到 1080P 及以上）' : '未带登录凭证（最高只到 720P）'
+        );
         await caster.cast(device, video, {
           danmakuMode: payload.danmakuMode,
           danmaku: payload.danmaku !== false,
-          cookie: String(payload.cookie || ''),
+          cookie,
           qn: Number(payload.qn) || 0,
+          allowHevc: payload.allowHevc !== false,
         });
         return reply(conn, id, caster.snapshot());
       }

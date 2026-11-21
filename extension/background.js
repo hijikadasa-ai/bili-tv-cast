@@ -265,7 +265,7 @@ async function ballCast(video) {
     throw new Error('没读到视频信息，刷新页面后再点一次');
   }
 
-  const saved = await chrome.storage.local.get(['devices', 'lastDeviceId', 'qn', 'danmakuMode']);
+  const saved = await chrome.storage.local.get(['devices', 'lastDeviceId', 'qn', 'danmakuMode', 'codecMode']);
   const devices = Array.isArray(saved.devices) ? saved.devices.filter((d) => d && d.ip) : [];
   const device = devices.find((d) => d.id === saved.lastDeviceId) || devices[0];
   if (!device) throw new Error('还没有选过电视，先点扩展图标搜一次（只需一次）');
@@ -275,6 +275,7 @@ async function ballCast(video) {
     cookie: await sessdata(),
     qn: Number(saved.qn) || 0,
     danmakuMode: saved.danmakuMode || 'native',
+    allowHevc: saved.codecMode !== 'avc',
     video: {
       bvid: video.bvid || '',
       aid: Number(video.aid) || 0,

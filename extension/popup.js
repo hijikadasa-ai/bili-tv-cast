@@ -17,6 +17,8 @@ const els = {
   manualBtn: $('manualBtn'),
   danmakuMode: $('danmakuMode'),
   danmakuHint: $('danmakuHint'),
+  codecMode: $('codecMode'),
+  defaultQn: $('defaultQn'),
   ballEnabled: $('ballEnabled'),
   castBtn: $('castBtn'),
   statusCard: $('statusCard'),
@@ -34,6 +36,7 @@ const els = {
 const prefs = {
   bridgeUrl: 'ws://127.0.0.1:8787',
   danmakuMode: 'native',
+  codecMode: 'auto',
   qn: 0,
   devices: [],
   lastDeviceId: null,
@@ -468,8 +471,9 @@ async function doCast() {
       {
         device,
         cookie: sessdata,
-        qn: Number(els.qualitySelect.value) || prefs.qn || 0,
+        qn: prefs.qn || 0,
         danmakuMode: prefs.danmakuMode,
+        allowHevc: prefs.codecMode !== 'avc',
         video: {
           bvid: video.bvid,
           aid: video.aid,
@@ -540,6 +544,10 @@ async function switchQuality(qn) {
   const value = Number(qn) || 0;
   prefs.qn = value;
   chrome.storage.local.set({ qn: value });
+  // 「默认清晰度」跟着记住，下次投屏直接用这一档
+  if ([...els.defaultQn.options].some((o) => o.value === String(value))) {
+    els.defaultQn.value = String(value);
+  }
   if (!isCasting()) return;
 
   els.qualitySelect.disabled = true;
@@ -672,6 +680,7 @@ async function boot() {
     'bridgeUrl',
     'danmaku',
     'danmakuMode',
+    'codecMode',
     'qn',
     'lastDeviceId',
     'devices',
@@ -680,6 +689,7 @@ async function boot() {
   if (saved.bridgeUrl) prefs.bridgeUrl = saved.bridgeUrl;
   if (saved.danmakuMode) prefs.danmakuMode = saved.danmakuMode;
   else if (typeof saved.danmaku === 'boolean') prefs.danmakuMode = saved.danmaku ? 'native' : 'off';
+  if (saved.codecMode === 'avc') prefs.codecMode = 'avc';
   if (Number(saved.qn)) prefs.qn = Number(saved.qn);
   if (saved.lastDeviceId) prefs.lastDeviceId = saved.lastDeviceId;
   if (Array.isArray(saved.devices) && saved.devices.length) {
@@ -689,6 +699,10 @@ async function boot() {
 
   els.danmakuMode.value = prefs.danmakuMode;
   els.danmakuHint.textContent = DANMAKU_HINT[prefs.danmakuMode] || '';
+  els.codecMode.value = prefs.codecMode;
+  if ([...els.defaultQn.options].some((o) => o.value === String(prefs.qn || 0))) {
+    els.defaultQn.value = String(prefs.qn || 0);
+  }
   els.ballEnabled.value = saved.ballEnabled === false ? 'off' : 'on';
 
   els.scanBtn.addEventListener('click', () => scanDevices({ full: true }));
@@ -705,6 +719,20 @@ async function boot() {
     const on = els.ballEnabled.value !== 'off';
     chrome.storage.local.set({ ballEnabled: on });
     addLog(on ? '网页悬浮球已开启（刷新页面后出现在右下角）' : '网页悬浮球已隐藏');
+  });
+  els.codecMode.addEventListener('change', () => {
+    prefs.codecMode = els.codecMode.value === 'avc' ? 'avc' : 'auto';
+    chrome.storage.local.set({ codecMode: prefs.codecMode });
+    addLog(
+      prefs.codecMode === 'avc'
+        ? '已改为只用 H.264：4K/HDR 用不了，但老电视最稳；重新投屏生效'
+        : '已改为自动编码：1080P 优先 H.264，4K/HDR 用 H.265；重新投屏生效'
+    );
+  });
+  els.defaultQn.addEventListener('change', () => {
+    prefs.qn = Number(els.defaultQn.value) || 0;
+    chrome.storage.local.set({ qn: prefs.qn });
+    addLog(`默认清晰度：${els.defaultQn.selectedOptions[0]?.textContent || '自动'}`);
   });
 
   connectBridge();
