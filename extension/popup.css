@@ -520,3 +520,11 @@ body {
 .log-line.error {
   color: var(--red);
 }
+
+.ver-line {
+  margin: 8px 2px 4px;
+  font-size: 11px;
+  color: var(--muted, #8a8f98);
+  text-align: right;
+  letter-spacing: 0.2px;
+}

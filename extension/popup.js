@@ -31,7 +31,24 @@ const els = {
   pauseBtn: $('pauseBtn'),
   seekBackBtn: $('seekBackBtn'),
   logBox: $('logBox'),
+  verLine: $('verLine'),
 };
+
+const EXT_VERSION = (() => {
+  try {
+    return chrome.runtime.getManifest().version;
+  } catch (_) {
+    return '?';
+  }
+})();
+let bridgeBuild = '';
+
+/** 底部版本行：一眼看出「扩展」和「桥接」各是什么版本，避免版本对不上 */
+function renderVersion() {
+  if (!els.verLine) return;
+  const b = bridgeBuild ? `桥接 build ${bridgeBuild}` : '桥接未连接';
+  els.verLine.textContent = `扩展 v${EXT_VERSION} · ${b}`;
+}
 
 const prefs = {
   bridgeUrl: 'ws://127.0.0.1:8787',
@@ -129,6 +146,8 @@ function connectBridge() {
 
 function onBridgeDown(reason) {
   bridgeReady = false;
+  bridgeBuild = '';
+  renderVersion();
   setPill('桥接未连接', 'off');
   for (const [, p] of pending) p.reject(new Error('桥接已断开'));
   pending.clear();
@@ -146,7 +165,12 @@ function onBridgeDown(reason) {
 function handleBridgeMessage(msg) {
   switch (msg.type) {
     case 'hello':
+      bridgeBuild = msg.build || '';
+      renderVersion();
       addLog(`桥接服务已就绪${msg.build ? `（build ${msg.build}）` : ''}`);
+      if (msg.build && msg.build !== EXT_VERSION) {
+        addLog(`提示：扩展是 v${EXT_VERSION}，桥接是 build ${msg.build}`, 'warn');
+      }
       if (!msg.build) {
         addLog('桥接是旧版本，请关掉那个黑色窗口，重新双击「1.启动桥接.bat」', 'error');
       }
@@ -752,6 +776,7 @@ async function boot() {
     addLog(`默认清晰度：${els.defaultQn.selectedOptions[0]?.textContent || '自动'}`);
   });
 
+  renderVersion();
   connectBridge();
   await readVideoFromTab();
   renderCastButton();
