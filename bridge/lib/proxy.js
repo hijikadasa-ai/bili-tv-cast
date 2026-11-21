@@ -376,9 +376,11 @@ class StreamProxy {
       if (!res.writableEnded) upstream.destroy();
     });
 
-    // 上游连上却迟迟不给数据，视为节点异常
-    upstream.setTimeout(15000, () => {
-      upstream.destroy(new Error('上游 15 秒没有数据'));
+    // 上游连上却迟迟不给数据，视为节点异常。
+    // 注意别设太短：电视暂停/缓冲时播放器会停止读取，socket 会短暂空闲，
+    // 误杀会让恢复播放时卡住，所以放到 60 秒。
+    upstream.setTimeout(60000, () => {
+      upstream.destroy(new Error('上游 60 秒没有数据'));
     });
 
     upstream.end();
