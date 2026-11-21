@@ -16,6 +16,7 @@ const { EventEmitter } = require('events');
 const os = require('os');
 const nva = require('./nva');
 const bili = require('./bili');
+const cloud = require('./cloud');
 
 const PLAY_STATE = {
   LOADING: 3,
@@ -103,9 +104,9 @@ class Caster extends EventEmitter {
       quality: {
         qn: this.quality,
         label: qualityLabel(this.qualities, this.quality),
-        source: this.stream ? this.stream.source : '',
-        // 现在一律走本机转发（电视直连 CDN 会 0 网速），这里保留字段兼容面板
-        needsProxy: true,
+        source: this.cloudMode ? 'cloud' : this.stream ? this.stream.source : '',
+        // 原生云投由电视自己取流；HLS 模式下必须走本机转发
+        needsProxy: !this.cloudMode,
       },
       qualityNote: this.qualityNote,
       qualities: this.qualities,
@@ -229,6 +230,7 @@ class Caster extends EventEmitter {
     this.qualityNote = '';
     this._localClock = null;
     this._lastReportAt = 0;
+    this.cloudMode = false;
 
     if (DANMAKU_MODES.includes(opts.danmakuMode)) this.danmakuMode = opts.danmakuMode;
     else if (typeof opts.danmaku === 'boolean') this.danmakuMode = opts.danmaku ? 'native' : 'off';
@@ -266,6 +268,29 @@ class Caster extends EventEmitter {
               this._log('warn', `弹幕加载失败：${err.message}`);
             })
         : Promise.resolve();
+
+    // 1.5) 原生云投（手机同款）：只把带 aid/cid 的 deep link 交给电视，
+    //      电视自己调 playurl 播放。ADB 不可用时自动回退到本机 HLS 方案。
+    if (cloud.isEnabled()) {
+      const native = cloud.launch({ device, video, qn: this.requestedQn || 80 });
+      if (native.ok) {
+        this.cloudMode = true;
+        this.stream = null;
+        this.quality = native.qn;
+        this.qualities = [];
+        this.qualityNote = '电视原生云投（本机不转流）';
+        this._clearWatchdog();
+        this.client.getVolume();
+        this._applyDanmakuMode();
+        this._startTicker();
+        this._log('info', `已下发原生云投链接：${video.title || video.bvid || video.cid}`);
+        await loadTask;
+        this._emitState();
+        return;
+      }
+      this._log('warn', `原生云投不可用，回退本机转发：${native.reason}`);
+    }
+    this.cloudMode = false;
 
     // 2) 拉播放地址
     this._log('info', '正在获取播放地址…');
@@ -662,6 +687,18 @@ class Caster extends EventEmitter {
     if (this._switching) throw new Error('正在切换清晰度，请稍候');
     const target = Number(qn) || 0;
     const pos = Math.max(0, Math.round(this.position) || 0);
+
+    if (this.cloudMode) {
+      const native = cloud.launch({ device: this.device, video: this.video, qn: target });
+      if (!native.ok) throw new Error(native.reason || '原生云投下发失败');
+      this.quality = native.qn;
+      this.qualityNote = '电视原生云投（本机不转流）';
+      this.position = pos;
+      this.playState = PLAY_STATE.LOADING;
+      this._log('info', `已切换到 ${qualityLabel([], native.qn)}，从 ${pos} 秒继续`);
+      this._emitState();
+      return this.snapshot();
+    }
 
     this._switching = true;
     try {
