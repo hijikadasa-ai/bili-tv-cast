@@ -74,6 +74,7 @@ class Caster extends EventEmitter {
     this._timer = null;
     this._watchdog = null;
     this._watchdogDepth = 0;
+    this._watchdogAttempts = 0;
     this._danmakuRetry = null;
     this._reconnecting = false;
     this._stoppedByUser = false;
@@ -258,6 +259,7 @@ class Caster extends EventEmitter {
 
     // 2) 拉播放地址
     this._log('info', '正在获取播放地址…');
+    this._watchdogAttempts = 0;
     const stream = await this._fetchStream(this.requestedQn);
     this.stream = stream;
     this.quality = stream.qn;
@@ -291,7 +293,7 @@ class Caster extends EventEmitter {
    * 拉播放地址：先要合并流（单文件，最稳）；目标 ≥1080P 而合并流只给到
    * 720P 时，改走 DASH 分轨——B 站新视频的高分辨率只存在 DASH 里。
    */
-  async _fetchStream(want) {
+  async _fetchStream(want, avoidHost, mergedOnly) {
     const video = this.video || {};
     const input = {
       aid: video.aid,
@@ -300,35 +302,55 @@ class Caster extends EventEmitter {
       epId: video.epid || video.epId || 0,
       cookie: this.accessCookie,
       qn: want,
+      avoidHost: avoidHost || '',
     };
 
-    let stream = await bili.fetchPlayUrl(input);
     const target = Number(want) || 0;
     const forceDash = process.env.BILI_FORCE_DASH === '1';
-    if (target < 80 || (stream.qn >= target && !forceDash)) return stream;
+    const forceMerged = process.env.BILI_FORCE_MERGED === '1';
 
+    // 合并流：用来拿清晰度列表，也是 DASH 失败时的兜底
+    let merged = null;
     try {
-      const dash = await bili.fetchDashStreams(input, target);
-      // 分轨清晰度不比合并流高就没必要折腾（未登录时 DASH 只给 480P）
-      if (!forceDash && dash.video.id <= stream.qn) return stream;
-      this._log(
-        'info',
-        `合并流最高只有 ${qualityLabel(this.qualities, stream.qn)}，改用 DASH 分轨（${dash.video.width}x${dash.video.height}）`
-      );
-      return {
-        url: '',
-        dash,
-        qn: dash.video.id,
-        source: 'dash',
-        timelength: dash.duration * 1000,
-        needsProxy: false,
-        accept: stream.accept || [],
-        lines: [...(stream.lines || []), { source: 'dash', qn: dash.video.id }],
-      };
+      merged = await bili.fetchPlayUrl(input);
     } catch (err) {
-      this._log('warn', `DASH 分轨不可用：${err.message}`);
-      return stream;
+      if (target < 80) throw err;
+      this._log('warn', `合并流没拿到（${err.message}），继续尝试 DASH 分轨`);
     }
+
+    // 1080P 及以上直接走 DASH 分轨：
+    // 高清只存在分轨里，而且电视只拉需要的那一路，比整段 mp4 省带宽、能拖动。
+    if ((target >= 80 || forceDash) && !forceMerged && !mergedOnly) {
+      try {
+        const dash = await bili.fetchDashStreams(input, target);
+        if (dash.video.id < Math.min(target, 80)) {
+          throw new Error(`分轨最高只有 ${bili.qnLabel(dash.video.id)}`);
+        }
+        const speed = Number(dash.video.speed) || 0;
+        this._log(
+          'info',
+          `取流节点：${dash.video.host || '未知'}${speed ? `（实测 ${(speed / 1024).toFixed(1)} MB/s）` : ''}`
+        );
+        if (merged && merged.parts > 1) {
+          this._log('info', `合并流被切成 ${merged.parts} 段，已用分轨播放整段`);
+        }
+        return {
+          url: '',
+          dash,
+          qn: dash.video.id,
+          source: 'dash',
+          timelength: dash.duration * 1000,
+          needsProxy: false,
+          accept: (merged && merged.accept && merged.accept.length ? merged.accept : this.qualities) || [],
+          lines: [...((merged && merged.lines) || []), { source: 'dash', qn: dash.video.id }],
+        };
+      } catch (err) {
+        this._log('warn', `DASH 分轨不可用（${err.message}），改用合并流`);
+      }
+    }
+
+    if (!merged) throw new Error('获取播放地址失败');
+    return merged;
   }
 
   /**
@@ -370,7 +392,7 @@ class Caster extends EventEmitter {
       return stream.url;
     }
 
-    const token = this.proxy.register(stream.url, { qn: stream.qn });
+    const token = this.proxy.register(stream.url, { qn: stream.qn, urls: stream.urls || [] });
     const url = this.proxy.urlFor(host, token);
     this._playUrlCache = { key: stream.url, url };
     this._log('info', `该地址需登录态鉴权，已交给本机转发（${host}:${this.proxy.port}）`);
@@ -521,6 +543,7 @@ class Caster extends EventEmitter {
       const stream = await this._fetchStream(target);
 
       if (!this.client || this._stoppedByUser) return this.snapshot();
+      this._watchdogAttempts = 0;
 
       this.stream = stream;
       this.quality = stream.qn;
@@ -686,13 +709,63 @@ class Caster extends EventEmitter {
     if (this.playState === PLAY_STATE.PAUSED) return;
 
     // 已经在最兼容的线路上，再降级也没意义
-    if (this.stream && this.stream.source === 'tv') {
+    if (this.stream && this.stream.source === 'tv' && (this._watchdogAttempts || 0) >= 2) {
       this._log('error', '电视没能加载这个视频（连 360P 也不行），请确认电视网络能上网后重新投屏');
       return;
     }
 
-    const depth = this._watchdogDepth || 0;
-    if (depth >= 1) {
+    const attempt = this._watchdogAttempts || 0;
+
+    // 第 1 步：换 CDN 节点，按原清晰度重试——
+    // 多数情况是某个节点对第三方播放器限速，换条线就能正常播。
+    if (attempt === 0 && this.stream && Number(this.stream.qn) >= 80) {
+      this._watchdogAttempts = 1;
+      const avoid = (this.stream.dash && this.stream.dash.video && this.stream.dash.video.host) || '';
+      Promise.resolve()
+        .then(async () => {
+          this._log('warn', '电视没取到画面，正在换 CDN 节点按原清晰度重试…');
+          const stream = await this._fetchStream(this.quality || 80, avoid);
+          if (this._stoppedByUser || !this.client) return;
+          this.stream = stream;
+          this.quality = stream.qn;
+          this.qualityNote = '';
+          this._playUrlCache = null;
+          this.playState = PLAY_STATE.LOADING;
+          this._sendPlayUrl(stream, this.position);
+          this._pendingSeek = this.position > 3 ? this.position : 0;
+          this._seekTries = 0;
+          this._armWatchdog(0);
+          this._emitState();
+        })
+        .catch((err) => this._log('error', `换节点重试失败：${err.message}`));
+      return;
+    }
+
+    // 第 2 步：分轨始终不行，就退回合并流（部分视频 1080P 有单文件版本）
+    if (attempt <= 1 && this.stream && this.stream.source === 'dash') {
+      this._watchdogAttempts = 2;
+      const qn = this.quality || 80;
+      Promise.resolve()
+        .then(async () => {
+          this._log('warn', '高清分轨没播起来，正在改回合并流重试…');
+          const stream = await this._fetchStream(qn, '', true);
+          if (this._stoppedByUser || !this.client) return;
+          this.stream = stream;
+          this.quality = stream.qn;
+          this.qualityNote = '';
+          this._playUrlCache = null;
+          this.playState = PLAY_STATE.LOADING;
+          this._sendPlayUrl(stream, this.position);
+          this._pendingSeek = this.position > 3 ? this.position : 0;
+          this._seekTries = 0;
+          this._armWatchdog(0);
+          this._emitState();
+        })
+        .catch((err) => this._log('error', `合并流重试失败：${err.message}`));
+      return;
+    }
+
+    if (attempt >= 2) {
       this._log('error', '电视一直没能加载出画面，请确认电视网络正常后重新投屏');
       return;
     }
@@ -720,7 +793,8 @@ class Caster extends EventEmitter {
         this._pendingSeek = this.position > 3 ? this.position : 0;
         this._seekTries = 0;
         this._applyDanmakuMode();
-        this._armWatchdog(depth + 1);
+        this._watchdogAttempts = 3;
+        this._armWatchdog(0);
         this._log('info', `已切换到兼容线路：${qualityLabel(this.qualities, stream.qn)}`);
         this._emitState();
       })

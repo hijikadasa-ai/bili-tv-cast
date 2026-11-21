@@ -695,6 +695,8 @@ async function fetchPlayUrlViaHtml5(input, cid, qn) {
 
   return {
     url,
+    urls: durlUrls(json.data),
+    parts: durlParts(json.data),
     qn: Number(json.data.quality) || qn,
     source: 'html5',
     timelength: Number(json.data.timelength) || 0,
@@ -724,6 +726,8 @@ async function fetchPlayUrlViaWeb(input, cid, qn) {
 
   return {
     url,
+    urls: durlUrls(json.data),
+    parts: durlParts(json.data),
     qn: Number(json.data.quality) || qn,
     source: 'web',
     timelength: Number(json.data.timelength) || 0,
@@ -762,6 +766,8 @@ async function fetchPlayUrlViaWbi(input, cid, qn) {
 
   return {
     url,
+    urls: durlUrls(json.data),
+    parts: durlParts(json.data),
     qn: Number(json.data.quality) || qn,
     source: 'wbi',
     timelength: Number(json.data.timelength) || 0,
@@ -808,12 +814,156 @@ async function fetchPlayUrlViaTv(input, cid, qn) {
 
   return {
     url,
+    urls: durlUrls(json.data),
+    parts: durlParts(json.data),
     qn: Number(json.data.quality) || 0,
     source: 'tv',
     timelength: Number(json.data.timelength) || 0,
     needsProxy: true,
     accept: normalizeAccept(json.data),
   };
+}
+
+/** PCDN 节点：第三方播放器上容易掉速，选节点时让位给官方 upos */
+const PCDN_RE = /(mcdn\.bilivideo|szbdyd\.com|mountaintoys\.cn|pcdn|bilivideo\.com\.mcdn)/i;
+
+function safeHost(url) {
+  try {
+    return new URL(url).hostname;
+  } catch (_) {
+    return '';
+  }
+}
+
+function isPcdnUrl(url) {
+  return PCDN_RE.test(safeHost(url));
+}
+
+/** 试拉 128KB，量一下这个节点实际给多快（B 站每个分轨会给 2~4 个备用地址） */
+function probeNode(url, timeout = 2500) {
+  return new Promise((resolve) => {
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch (_) {
+      resolve({ url, ok: false, err: '地址无效' });
+      return;
+    }
+    const lib = parsed.protocol === 'https:' ? https : require('http');
+    const t0 = Date.now();
+    let bytes = 0;
+    let done = false;
+    let req = null;
+    const timer = setTimeout(() => {
+      try {
+        req && req.destroy();
+      } catch (_) {
+        /* ignore */
+      }
+      finish({ url, ok: bytes > 16384, bytes, speed: 0, err: '超时' });
+    }, timeout);
+
+    function finish(r) {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(r);
+    }
+
+    req = lib.request(
+      {
+        hostname: parsed.hostname,
+        port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+        path: parsed.pathname + parsed.search,
+        method: 'GET',
+        headers: {
+          'User-Agent': UA,
+          Referer: 'https://www.bilibili.com/',
+          Range: 'bytes=0-131071',
+        },
+      },
+      (res) => {
+        if (res.statusCode !== 200 && res.statusCode !== 206) {
+          res.resume();
+          finish({ url, ok: false, status: res.statusCode });
+          return;
+        }
+        res.on('data', (c) => {
+          bytes += c.length;
+          if (bytes >= 65536) {
+            const ms = Math.max(1, Date.now() - t0);
+            try {
+              req.destroy();
+            } catch (_) {
+              /* ignore */
+            }
+            finish({ url, ok: true, bytes, ms, speed: Math.round(bytes / 1024 / (ms / 1000)) });
+          }
+        });
+        res.on('end', () => {
+          const ms = Math.max(1, Date.now() - t0);
+          finish({
+            url,
+            ok: bytes > 16384,
+            bytes,
+            ms,
+            speed: Math.round(bytes / 1024 / (ms / 1000)),
+          });
+        });
+        res.on('error', () => finish({ url, ok: bytes > 16384, bytes, speed: 0 }));
+      }
+    );
+    req.on('error', (e) => finish({ url, ok: false, err: e.message }));
+    req.end();
+  });
+}
+
+/** 并行测速挑最快的节点；速度接近时优先官方 upos（PCDN 长时间容易掉速） */
+async function pickFastestNode(urls, avoidHost) {
+  const all = [...new Set((urls || []).filter(Boolean))];
+  if (!all.length) return { url: '', host: '', speed: 0, candidates: [] };
+  // 上一轮用过的节点没播起来时，优先换别的节点
+  const alts = avoidHost ? all.filter((u) => safeHost(u) !== avoidHost) : all;
+  const list = alts.length ? alts : all;
+  if (list.length === 1) {
+    return { url: list[0], host: safeHost(list[0]), speed: 0, candidates: all };
+  }
+  const probes = await Promise.all(list.slice(0, 4).map((u) => probeNode(u)));
+  const ok = probes.filter((p) => p.ok && p.speed > 0).sort((a, b) => b.speed - a.speed);
+  if (
+    ok.length > 1 &&
+    isPcdnUrl(ok[0].url) &&
+    !isPcdnUrl(ok[1].url) &&
+    ok[0].speed < ok[1].speed * 1.3
+  ) {
+    [ok[0], ok[1]] = [ok[1], ok[0]];
+  }
+  const best = ok[0];
+  if (!best) {
+    return { url: list[0], host: safeHost(list[0]), speed: 0, candidates: all };
+  }
+  return {
+    url: best.url,
+    host: safeHost(best.url),
+    speed: Math.round(best.speed || 0),
+    candidates: [...new Set([best.url, ...all.filter((u) => u !== best.url)])],
+  };
+}
+
+/**
+ * 挑电视能解码的音轨：只要 AAC（mp4a）。
+ * 大会员账号的 DASH 里会多出杜比全景声（ec-3）、Hi-Res（FLAC）等音轨，
+ * 带宽比 AAC 大得多，按带宽挑就会选中它们——电视解不了，表现就是
+ * 「一直缓冲、网速为 0」。手机 App 投屏正常是因为它自己会挑 AAC。
+ */
+function pickAudioTrack(audios) {
+  const aac = audios.filter((a) => /^mp4a/i.test(String(a.codecs || '')) || a.id === 30216 || a.id === 30232 || a.id === 30280);
+  const pool = aac.length ? aac : audios;
+  return pool.sort((a, b) => {
+    // 同是 AAC 时优先 192K（30280），再按带宽
+    const rank = (t) => (t.id === 30280 ? 3 : t.id === 30232 ? 2 : t.id === 30216 ? 1 : 0);
+    return rank(b) - rank(a) || b.bandwidth - a.bandwidth;
+  })[0];
 }
 
 /** 取 DASH 分轨（音视频分离）：新视频的 1080P 只存在这里 */
@@ -846,9 +996,11 @@ async function fetchDashStreams(input, wantQn) {
     const url = s.baseUrl || s.base_url || '';
     if (!url) return null;
     const sb = s.segment_base || s.segmentBase || {};
+    const backups = s.backupUrl || s.backup_url || [];
     return {
       url,
-      backup: (s.backupUrl || s.backup_url || [])[0] || '',
+      urls: [...new Set([url, ...backups].filter(Boolean))],
+      backup: backups[0] || '',
       id: Number(s.id) || 0,
       codecid: Number(s.codecid) || 0,
       codecs: s.codecs || '',
@@ -866,13 +1018,28 @@ async function fetchDashStreams(input, wantQn) {
   const audios = (d.dash.audio || []).map(norm).filter(Boolean);
   if (!videos.length || !audios.length) throw new Error('DASH 流不完整');
 
-  // 电视兼容性：优先 AVC(H.264)，同编码取清晰度最高
+  // 电视解码能力：优先 H.264；没有再用 H.265；AV1(13)、杜比视界(14) 老电视基本播不了
   const avc = videos.filter((v) => v.codecid === 7);
-  const pool = avc.length ? avc : videos;
-  const video = pool.sort((a, b) => b.id - a.id)[0];
-  const audio = audios.sort((a, b) => b.id - a.id)[0];
+  const hevc = videos.filter((v) => v.codecid === 12);
+  const pool = avc.length ? avc : hevc.length ? hevc : videos.filter((v) => v.codecid !== 13 && v.codecid !== 14);
+  const usable = pool.length ? pool : videos;
+  const cap = Math.min(Number(wantQn) || 80, 120);
+  const under = usable.filter((v) => v.id <= cap);
+  const videoTrack = (under.length ? under : usable).sort((a, b) => b.id - a.id)[0];
+  const audioTrack = pickAudioTrack(audios);
+  if (!videoTrack || !audioTrack) throw new Error('DASH 流不完整');
 
-  return { video, audio, duration: Math.round((Number(d.timelength) || 0) / 1000) };
+  // 每个分轨都有若干个 CDN 地址，实测挑最快的；其余留作转发层故障切换
+  const [vpick, apick] = await Promise.all([
+    pickFastestNode(videoTrack.urls, input.avoidHost),
+    pickFastestNode(audioTrack.urls, input.avoidHost),
+  ]);
+
+  return {
+    video: { ...videoTrack, url: vpick.url, urls: vpick.candidates, host: vpick.host, speed: vpick.speed },
+    audio: { ...audioTrack, url: apick.url, urls: apick.candidates, host: apick.host, speed: apick.speed },
+    duration: Math.round((Number(d.timelength) || 0) / 1000),
+  };
 }
 
 /** 只取合并流（durl）；dash 是纯视频轨，电视播了没声音，不要 */
@@ -881,6 +1048,18 @@ function pickDurl(data) {
     return data.durl[0].url;
   }
   return '';
+}
+
+/** 合并流的全部备用地址（CDN 有多条，转发层可自动切换） */
+function durlUrls(data) {
+  const d = Array.isArray(data.durl) && data.durl[0];
+  if (!d || !d.url) return [];
+  return [...new Set([d.url, ...(d.backup_url || d.backupUrl || [])].filter(Boolean))];
+}
+
+/** durl 分段数：>1 表示这个清晰度被切成了多段，投屏只能播第一段，不如走 DASH */
+function durlParts(data) {
+  return Array.isArray(data.durl) ? data.durl.length : 0;
 }
 
 module.exports = {

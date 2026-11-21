@@ -24,6 +24,14 @@ const ORIGIN = 'https://www.bilibili.com';
 /** 地址有效期（B 站签名的地址约 120 分钟失效，这里留足余量并定期清理） */
 const TTL_MS = 3 * 60 * 60 * 1000;
 
+/**
+ * 复用连接去上游。
+ * B 站分轨会被播放器切成大量小 Range 请求，每个请求都重新握手 TLS 会平白多出
+ * 几十毫秒延迟；1080P 码率高的时候这些延迟会累积成卡顿，所以必须 keep-alive。
+ */
+const agentHttp = new http.Agent({ keepAlive: true, maxSockets: 48, keepAliveMsecs: 30000 });
+const agentHttps = new https.Agent({ keepAlive: true, maxSockets: 48, keepAliveMsecs: 30000 });
+
 class StreamProxy {
   constructor(opts = {}) {
     this.port = Number(opts.port) || 8790;
@@ -34,13 +42,19 @@ class StreamProxy {
     this.hits = 0;
     this.bytes = 0;
     this.denied = 0;
+    this.lastSpeed = 0; // KB/s，最近一次采样
+    this._lastBytes = 0;
+    this._lastActiveAt = 0;
+    this._lastSpeedLogAt = 0;
+    this._speedTimer = null;
   }
 
   /** 登记一个上游地址，返回可给电视使用的 token */
   register(url, meta = {}) {
     this._gc();
     const token = crypto.randomBytes(12).toString('hex');
-    this.routes.set(token, { url, expires: Date.now() + TTL_MS, ...meta });
+    const urls = [...new Set([url, ...(meta.urls || [])].filter(Boolean))];
+    this.routes.set(token, { url, urls, expires: Date.now() + TTL_MS, ...meta });
     return token;
   }
 
@@ -57,8 +71,15 @@ class StreamProxy {
   registerDash(dash, meta = {}) {
     this._gc();
     const token = crypto.randomBytes(12).toString('hex');
-    const videoToken = this.register(dash.video.url, { qn: dash.video.id, kind: 'dash-video' });
-    const audioToken = this.register(dash.audio.url, { kind: 'dash-audio' });
+    const videoToken = this.register(dash.video.url, {
+      qn: dash.video.id,
+      kind: 'dash-video',
+      urls: dash.video.urls || [],
+    });
+    const audioToken = this.register(dash.audio.url, {
+      kind: 'dash-audio',
+      urls: dash.audio.urls || [],
+    });
     this.routes.set(token, {
       kind: 'dash',
       dash,
@@ -86,10 +107,41 @@ class StreamProxy {
       this.running = true;
       this.onLog('info', `流转发已就绪（${this.port} 端口），电视将通过本机取流`);
     });
+    this._startSpeedMeter();
     return this;
   }
 
+  /** 每 5 秒采样一次实际下发速度：卡顿的时候能直接看出是没数据还是码率不够 */
+  _startSpeedMeter() {
+    if (this._speedTimer) return;
+    this._speedTimer = setInterval(() => {
+      const now = Date.now();
+      const delta = this.bytes - this._lastBytes;
+      this._lastBytes = this.bytes;
+      if (delta <= 0) {
+        this.lastSpeed = 0;
+        return;
+      }
+      const kbps = Math.round(delta / 1024 / 5);
+      this.lastSpeed = kbps;
+      this._lastActiveAt = now;
+      // 头 8 秒内速度过低，八成是节点限速，提示一句方便排查
+      if (kbps < 150 && now - this._lastSpeedLogAt > 20000) {
+        this._lastSpeedLogAt = now;
+        this.onLog('warn', `取流速度偏低（${kbps} KB/s），可能节点限速，正在观察`);
+      } else if (now - this._lastSpeedLogAt > 60000) {
+        this._lastSpeedLogAt = now;
+        this.onLog('info', `取流速度 ${(kbps / 1024).toFixed(1)} MB/s`);
+      }
+    }, 5000);
+    if (this._speedTimer.unref) this._speedTimer.unref();
+  }
+
   stop() {
+    if (this._speedTimer) {
+      clearInterval(this._speedTimer);
+      this._speedTimer = null;
+    }
     if (this.server) {
       try {
         this.server.close();
@@ -103,7 +155,13 @@ class StreamProxy {
   }
 
   snapshot() {
-    return { port: this.port, running: this.running, routes: this.routes.size, hits: this.hits };
+    return {
+      port: this.port,
+      running: this.running,
+      routes: this.routes.size,
+      hits: this.hits,
+      kbps: this.lastSpeed,
+    };
   }
 
   _gc() {
@@ -152,7 +210,7 @@ class StreamProxy {
     }
 
     this.hits++;
-    this._forward(item.url, req, res, 0);
+    this._forward(item, req, res, 0, 0);
   }
 
   /** 生成 MPD：SegmentBase + indexRange，播放器可以直接按字节区间拖动 */
@@ -178,7 +236,7 @@ class StreamProxy {
     const fps = video.frameRate ? ` frameRate="${String(video.frameRate).replace('/', '/')}"` : '';
 
     return `<?xml version="1.0" encoding="utf-8"?>
-<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" mediaPresentationDuration="${iso}" minBufferTime="PT1.5S" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011">
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" mediaPresentationDuration="${iso}" minBufferTime="PT2S" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011">
   <Period duration="${iso}">
     <AdaptationSet contentType="video" mimeType="video/mp4" segmentAlignment="true" startWithSAP="1"${vRs}${fps}>
       <Representation id="v" bandwidth="${video.bandwidth || 2000000}" codecs="${vCodec}"${vRs}${fps}>
@@ -187,7 +245,7 @@ class StreamProxy {
       </Representation>
     </AdaptationSet>
     <AdaptationSet contentType="audio" mimeType="audio/mp4" segmentAlignment="true" lang="und">
-      <Representation id="a" bandwidth="${audio.bandwidth || 132000}" codecs="${aCodec}" audioSamplingRate="44100">
+      <Representation id="a" bandwidth="${audio.bandwidth || 132000}" codecs="${aCodec}" audioSamplingRate="48000">
         <BaseURL>${aUrl}</BaseURL>
         ${segBase(audio)}
       </Representation>
@@ -196,23 +254,37 @@ class StreamProxy {
 </MPD>`;
   }
 
-  _forward(target, req, res, redirects) {
+  /**
+   * 把电视的请求转给上游。
+   * - 每个分轨登记了多个 CDN 地址：某个节点限速/403/超时就换下一个；
+   * - 走 keep-alive 连接池，避免每个小 Range 都重新握手；
+   * - 电视断开就掐掉上游，别让连接挂着耗带宽。
+   */
+  _forward(item, req, res, attempt, redirects) {
+    const list = (Array.isArray(item.urls) && item.urls.length ? item.urls : [item.url]).filter(Boolean);
+    const target = list[attempt] || item.url;
+
     let u;
     try {
       u = new URL(target);
     } catch (_) {
+      if (attempt + 1 < list.length) return this._forward(item, req, res, attempt + 1, redirects);
       res.writeHead(502);
       return res.end('bad upstream');
     }
 
     const lib = u.protocol === 'https:' ? https : http;
+    const agent = u.protocol === 'https:' ? agentHttps : agentHttp;
     const headers = {
       'User-Agent': UA,
       Referer: REFERER,
       Origin: ORIGIN,
       Accept: '*/*',
+      'Accept-Encoding': 'identity',
     };
     if (req.headers.range) headers.Range = req.headers.range;
+
+    let headerSent = false;
 
     const upstream = lib.request(
       {
@@ -221,6 +293,7 @@ class StreamProxy {
         path: u.pathname + u.search,
         method: req.method === 'HEAD' ? 'HEAD' : 'GET',
         headers,
+        agent,
       },
       (ur) => {
         const code = ur.statusCode || 0;
@@ -232,14 +305,30 @@ class StreamProxy {
           try {
             next = new URL(ur.headers.location, target).toString();
           } catch (_) {
+            if (attempt + 1 < list.length) {
+              return this._forward(item, req, res, attempt + 1, redirects);
+            }
             res.writeHead(502);
             return res.end('bad redirect');
           }
-          return this._forward(next, req, res, redirects + 1);
+          return this._forward({ ...item, url: next, urls: [next] }, req, res, 0, redirects + 1);
+        }
+
+        // 节点不给数据就换备用节点（B 站每个分轨都给 2~4 个）
+        if ((code === 403 || code === 404 || code === 410 || code >= 500) && attempt + 1 < list.length) {
+          ur.resume();
+          this.onLog('warn', `节点 ${u.hostname} 返回 ${code}，自动切换备用节点`);
+          return this._forward(item, req, res, attempt + 1, redirects);
         }
 
         if (code === 403 || code === 401) {
           this.onLog('warn', `上游拒绝访问（${code}），地址可能已过期，重新投屏可刷新`);
+        }
+
+        // 切到备用节点后能取流，就把它提到首位，后续请求不用再重试坏节点
+        if (attempt > 0 && code >= 200 && code < 300) {
+          item.urls = [target, ...(item.urls || []).filter((x) => x !== target)];
+          item.url = target;
         }
 
         const out = { 'Accept-Ranges': 'bytes', 'Cache-Control': 'no-store' };
@@ -247,6 +336,7 @@ class StreamProxy {
         if (ur.headers['content-length']) out['Content-Length'] = ur.headers['content-length'];
         if (ur.headers['content-range']) out['Content-Range'] = ur.headers['content-range'];
 
+        headerSent = true;
         res.writeHead(code, out);
         if (req.method === 'HEAD') {
           ur.resume();
@@ -260,17 +350,35 @@ class StreamProxy {
     );
 
     upstream.on('error', (err) => {
-      this.onLog('warn', `流转发失败：${err.message}`);
+      if (!headerSent) {
+        if (attempt + 1 < list.length) {
+          this.onLog('warn', `节点 ${u.hostname} 取流失败（${err.message}），自动切换备用节点`);
+          return this._forward(item, req, res, attempt + 1, redirects);
+        }
+        this.onLog('warn', `流转发失败：${err.message}`);
+        try {
+          res.writeHead(502);
+          res.end();
+        } catch (_) {
+          /* 已经发过响应头 */
+        }
+        return;
+      }
       try {
-        res.writeHead(502);
-        res.end();
+        res.destroy();
       } catch (_) {
-        /* 已经发过响应头 */
+        /* ignore */
       }
     });
 
-    upstream.setTimeout(20000, () => {
-      upstream.destroy(new Error('上游超时'));
+    // 电视提前断流（拖动/停止）时把上游也停掉
+    res.on('close', () => {
+      if (!res.writableEnded) upstream.destroy();
+    });
+
+    // 上游连上却迟迟不给数据，视为节点异常
+    upstream.setTimeout(15000, () => {
+      upstream.destroy(new Error('上游 15 秒没有数据'));
     });
 
     upstream.end();
