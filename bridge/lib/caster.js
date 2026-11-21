@@ -31,7 +31,7 @@ const QUEUE_LIMIT = 400;
 const RESYNC_FORWARD = 8; // 进度向前跳变超过 8s 视为 seek
 const RESYNC_BACKWARD = 1.5; // 向后跳变超过 1.5s 视为 seek（容忍进度抖动）
 const LOOKBACK = 0.6; // 起播/seek 时补发多少秒内的弹幕
-const WATCHDOG_MS = 13000; // 起播看门狗
+const WATCHDOG_MS = Number(process.env.BILI_WATCHDOG_MS || 13000); // 起播看门狗
 const DANMAKU_MODES = ['native', 'relay', 'off'];
 
 class Caster extends EventEmitter {
@@ -100,7 +100,8 @@ class Caster extends EventEmitter {
         qn: this.quality,
         label: qualityLabel(this.qualities, this.quality),
         source: this.stream ? this.stream.source : '',
-        needsProxy: Boolean(this.stream && this.stream.needsProxy),
+        // 现在一律走本机转发（电视直连 CDN 会 0 网速），这里保留字段兼容面板
+        needsProxy: true,
       },
       qualityNote: this.qualityNote,
       qualities: this.qualities,
@@ -222,6 +223,8 @@ class Caster extends EventEmitter {
     this._stoppedByUser = false;
     this._playUrlCache = null;
     this.qualityNote = '';
+    this._localClock = null;
+    this._lastReportAt = 0;
 
     if (DANMAKU_MODES.includes(opts.danmakuMode)) this.danmakuMode = opts.danmakuMode;
     else if (typeof opts.danmaku === 'boolean') this.danmakuMode = opts.danmaku ? 'native' : 'off';
@@ -270,9 +273,7 @@ class Caster extends EventEmitter {
     this.qualityNote = (await this._noteForQuality(this.requestedQn, stream)) || this._codecNote(stream);
     this._log(
       'info',
-      `播放地址已就绪：${qualityLabel(this.qualities, stream.qn)}（来源 ${stream.source}${
-        stream.needsProxy ? '，走本机转发' : ''
-      }）`
+      `播放地址已就绪：${qualityLabel(this.qualities, stream.qn)}（${stream.source}，走本机转发）`
     );
     if (this.qualityNote) this._log('warn', this.qualityNote);
 
@@ -317,11 +318,20 @@ class Caster extends EventEmitter {
 
     // 合并流：用来拿清晰度列表，也是 DASH 失败时的兜底
     let merged = null;
-    try {
-      merged = await bili.fetchPlayUrl(input);
-    } catch (err) {
-      if (target < 80) throw err;
-      this._log('warn', `合并流没拿到（${err.message}），继续尝试 DASH 分轨`);
+    for (let i = 0; ; i++) {
+      try {
+        merged = await bili.fetchPlayUrl(input);
+        break;
+      } catch (err) {
+        // 接口偶发风控抖动（「请求错误」），隔 1.2 秒再试一次
+        if (i >= 1 || (target < 80 && i >= 1)) {
+          if (target < 80) throw err;
+          this._log('warn', `合并流没拿到（${err.message}），继续尝试 DASH 分轨`);
+          break;
+        }
+        this._log('warn', `合并流没拿到（${err.message}），正在重试…`);
+        await new Promise((r) => setTimeout(r, 1200));
+      }
     }
 
     // 1080P 及以上直接走 DASH 分轨：
@@ -330,7 +340,7 @@ class Caster extends EventEmitter {
       try {
         const dash = await bili.fetchDashStreams(input, target, { allowHevc });
         // allowHevc=false 的补救场景允许降到更低的 H.264 档，不再卡这条下限
-        const floor = extra.allowLower ? 0 : Math.min(target, 80);
+        const floor = extra.allowLower || forceDash ? 0 : Math.min(target, 80);
         if (dash.video.id < floor) {
           throw new Error(`分轨最高只有 ${bili.qnLabel(dash.video.id)}`);
         }
@@ -394,8 +404,15 @@ class Caster extends EventEmitter {
     }
 
     if (!stream || !stream.url) throw new Error('没有可用的播放地址');
-    if (!stream.needsProxy) return stream.url;
 
+    // 不管三七二十一都走本机转发。
+    // 实测：就算接口给的是「免 Referer」的 html5 地址，电视自己直连 B 站 CDN
+    // 也经常 0 网速（PCDN 节点按 UA/地区限流，或者干脆拒绝电视的请求），
+    // 而电脑这边同一个地址是通的。让电视只认本机，链路就只剩一段局域网。
+    if (process.env.BILI_NO_PROXY === '1') {
+      this._log('warn', '调试模式：直接给电视 B 站原始地址');
+      return stream.url;
+    }
     if (!this.proxy || !this.proxy.running) {
       this._log('warn', '本机转发未就绪，直接用原始地址（可能被 CDN 拒绝）');
       return stream.url;
@@ -414,7 +431,7 @@ class Caster extends EventEmitter {
     const token = this.proxy.register(stream.url, { qn: stream.qn, urls: stream.urls || [] });
     const url = this.proxy.urlFor(host, token);
     this._playUrlCache = { key: stream.url, url };
-    this._log('info', `该地址需登录态鉴权，已交给本机转发（${host}:${this.proxy.port}）`);
+    this._log('info', `已交给本机转发（${host}:${this.proxy.port}），电视不直连 B 站 CDN`);
     return url;
   }
 
@@ -561,8 +578,46 @@ class Caster extends EventEmitter {
     const base = this._playUrlFor(stream);
     const sep = base.includes('?') ? '&' : '?';
     const url = base + sep + 'nva_ext=' + encodeURIComponent(JSON.stringify({ ver: 2, content }));
-    this.client.sendCommand('PlayUrl', { url, title: video.title || '' });
-    this._playIssuedAt = Date.now();
+    // 官方流程是先 Stop 再设置地址：上一次失败的会话会把播放器卡在「缓冲中」，
+    // 不先停掉就直接下发新地址，电视会出现「一直在加载、0 网速」
+    let issued = false;
+    const issue = () => {
+      issued = true;
+      this.client.sendCommand('PlayUrl', { url, title: video.title || '' });
+      this._playIssuedAt = Date.now();
+    };
+    if (process.env.BILI_STOP_FIRST !== '0') {
+      this.client.sendCommand('Stop');
+      // 停掉上一次会话后给电视一点时间回到接收页，再塞新地址
+      setTimeout(() => {
+        if (this.client) issue();
+      }, 450);
+    } else {
+      issue();
+    }
+    // 部分固件只认「PlayUrl 之后再补一条 Play」才会真正起播
+    // （只发 PlayUrl 时表现为：取了几百 KB 就停住、电视一直显示 0 网速）
+    if (process.env.BILI_SEND_PLAY === '1') {
+      const counter = this.client.sendCommand('Play', {
+        aid: String(video.aid || ''),
+        cid: String(video.cid || ''),
+        epid: String(epId),
+        epId: String(epId),
+        oid: String(oid),
+        season_id: String(video.seasonId || 0),
+        seasonId: String(video.seasonId || 0),
+        content_type: 1,
+        contentType: 1,
+        seekTs: Math.max(0, Math.round(seekTs) || 0),
+        current_qn: stream.qn || 0,
+        desire_qn: stream.qn || 0,
+        userDesireQn: stream.qn || 0,
+        danmakuSwitchSave: this.danmakuMode !== 'off',
+        userDesireSpeed: 1,
+        build: '106400100',
+      });
+      this._log('info', `已补发 Play 指令（#${counter}）`);
+    }
   }
 
   /**
@@ -628,6 +683,7 @@ class Caster extends EventEmitter {
     this.client.seek(target);
     this.position = target;
     this.lastPos = target;
+    this._localClock = { at: Date.now(), pos: target };
     this.queue = [];
     this.cursor = this._lowerBound(target);
     this._emitState();
@@ -727,6 +783,9 @@ class Caster extends EventEmitter {
   _armWatchdog(depth) {
     this._clearWatchdog();
     this._watchdogDepth = depth;
+    // 记下此刻的转发字节数：下一次看门狗触发时用它判断电视是否真的在消费数据
+    this._watchBytesBase = this.proxy ? Number(this.proxy.snapshot().bytes) || 0 : 0;
+    this._watchArmedAt = Date.now();
     this._watchdog = setTimeout(() => this._onWatchdog(), WATCHDOG_MS);
     if (this._watchdog.unref) this._watchdog.unref();
   }
@@ -751,6 +810,28 @@ class Caster extends EventEmitter {
     const mpdHits = Number(stats.mpdHits) || 0;
     const segHits = Number(stats.segHits) || 0;
     const isDash = Boolean(this.stream && this.stream.source === 'dash');
+
+    // 电视在持续消费数据就别去打断它。
+    // 部分固件（Sony BRAVIA）投屏后不回传 OnProgress/OnPlayState，
+    // 只看协议状态会误判成「没播起来」，把正在放的画面硬切回低清晰度。
+    const grown = (Number(stats.bytes) || 0) - (Number(this._watchBytesBase) || 0);
+    const armedFor = Date.now() - (Number(this._watchArmedAt) || 0);
+    if (grown > 2 * 1048576) {
+      if (this.playState !== PLAY_STATE.PLAYING) {
+        this._log(
+          'info',
+          `电视 ${Math.round(armedFor / 1000)} 秒内拉取了 ${(grown / 1048576).toFixed(1)} MB，判定为正在播放`
+        );
+        this.playState = PLAY_STATE.PLAYING;
+        if (!this._localClock) {
+          this._localClock = { at: Date.now(), pos: this.position || 0 };
+        }
+        this._emitState();
+      }
+      this._watchdogAttempts = 0;
+      this._armWatchdog(0);
+      return;
+    }
 
     if (isDash) {
       this._log(
@@ -865,12 +946,17 @@ class Caster extends EventEmitter {
 
   _onCommand(msg) {
     const { method, params, counter } = msg;
+    if (process.env.BILI_NVA_TRACE === '1') {
+      this._log('info', `电视上行 ${method} ${JSON.stringify(params).slice(0, 220)}`);
+    }
 
     switch (method) {
       case 'OnProgress': {
         const pos = Number(params && params.position) || 0;
         const dur = Number(params && params.duration) || 0;
         if (dur > 0 && pos > 0) this._clearWatchdog();
+        this._lastReportAt = Date.now();
+        this._localClock = { at: Date.now(), pos };
         this._onProgress(pos, dur);
         this._ack(counter);
         break;
@@ -1040,6 +1126,19 @@ class Caster extends EventEmitter {
   }
 
   _tick() {
+    // 电视不回传 OnProgress 时（部分固件），用本地时钟估算进度让面板/弹幕跟得上
+    if (
+      this.playState === PLAY_STATE.PLAYING &&
+      this._localClock &&
+      (!this._lastReportAt || Date.now() - this._lastReportAt > 8000)
+    ) {
+      const est = this._localClock.pos + (Date.now() - this._localClock.at) / 1000;
+      if (!this.duration || est < this.duration + 5) {
+        this.position = Math.max(this.position, est);
+        this._onProgress(this.position, this.duration);
+      }
+    }
+
     if (!this.client || !this.queue.length) return;
     if (this.danmakuMode !== 'relay') return;
     if (this.playState === PLAY_STATE.PAUSED) return;

@@ -30,7 +30,7 @@ const PORT = Number(process.env.BILI_CAST_PORT || 8787);
 const PROXY_PORT = Number(process.env.BILI_CAST_PROXY_PORT || 8790);
 const HOST = '127.0.0.1';
 const VERSION = '1.0.0';
-const BUILD = '1.4.0';
+const BUILD = '1.4.2';
 const SERVICE = 'bili-tv-cast';
 
 // 流转发：pc 线路的地址有 Referer 防盗链，电视裸连会 403，需要本机代取
@@ -113,6 +113,18 @@ const server = http.createServer((req, res) => {
   if (req.url === '/state') {
     return json(res, 200, caster.snapshot());
   }
+  // 自检：用缓存的登录凭证完整跑一遍「取流 → 生成清单 → 从本机转发拉分片」
+  // 只在排查时用，电视播不播得动不依赖它
+  if (req.url.startsWith('/selftest') && isLocal(req)) {
+    const q = new URL(req.url, 'http://127.0.0.1');
+    runSelfTest(
+      res,
+      String(q.searchParams.get('bvid') || ''),
+      Number(q.searchParams.get('qn')) || 80,
+      q.searchParams.get('codec') === 'avc' ? false : true
+    );
+    return undefined;
+  }
   // 只允许本机调用：方便新版启动时把旧实例请下去
   if (req.url === '/shutdown' && isLocal(req)) {
     json(res, 200, { ok: true });
@@ -133,6 +145,89 @@ const server = http.createServer((req, res) => {
 function isLocal(req) {
   const addr = (req.socket.remoteAddress || '').replace('::ffff:', '');
   return addr === '127.0.0.1' || addr === '::1';
+}
+
+/** 本机 HTTP GET（自检用）：量首字节延迟和吞吐 */
+function localGet(path, range, timeout = 20000) {
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    const req = http.request(
+      {
+        host: '127.0.0.1',
+        port: proxy.port,
+        path,
+        method: 'GET',
+        headers: range ? { Range: range } : {},
+      },
+      (r) => {
+        let bytes = 0;
+        let first = 0;
+        r.on('data', (c) => {
+          bytes += c.length;
+          if (!first) first = Date.now() - t0;
+        });
+        r.on('end', () =>
+          resolve({
+            status: r.statusCode,
+            type: r.headers['content-type'],
+            range: r.headers['content-range'],
+            bytes,
+            firstByteMs: first,
+            ms: Date.now() - t0,
+            mbps: Number(((bytes / 1048576) / Math.max(0.001, (Date.now() - t0) / 1000)).toFixed(2)),
+          })
+        );
+        r.on('error', (e) => resolve({ status: r.statusCode, bytes, err: e.message }));
+      }
+    );
+    req.setTimeout(timeout, () => req.destroy(new Error('timeout')));
+    req.on('error', (e) => resolve({ status: 0, bytes: 0, err: e.message, ms: Date.now() - t0 }));
+    req.end();
+  });
+}
+
+async function runSelfTest(res, bvid, qn, allowHevc) {
+  const out = { bvid, qn, allowHevc, cookie: false, login: null, accept: [], dash: null, mpd: null, first: null, mid: null };
+  try {
+    const cookie = readCachedCookie();
+    out.cookie = Boolean(cookie);
+    if (!cookie) {
+      out.hint = '还没有登录凭证：先在网页上投一次屏，扩展会把 Cookie 同步过来';
+      return json(res, 200, out);
+    }
+    const meta = await bili.resolveVideo({ bvid });
+    out.title = meta.title;
+    out.cid = meta.cid;
+    out.login = await bili.checkLogin(cookie);
+    const dash = await bili.fetchDashStreams(
+      { bvid, cid: meta.cid, aid: meta.aid, epId: meta.epid || 0, cookie },
+      qn,
+      { allowHevc }
+    );
+    out.accept = (dash.accept || []).map((x) => x.qn);
+    out.dash = {
+      qn: dash.video.id,
+      codec: dash.codec,
+      size: `${dash.video.width}x${dash.video.height}`,
+      host: dash.video.host,
+      speedMBs: Number(((Number(dash.video.speed) || 0) / 1024).toFixed(2)),
+      initRange: dash.video.initRange,
+      indexRange: dash.video.indexRange,
+      audio: dash.audio.codecs,
+      duration: dash.duration,
+      avcMax: dash.avcMax,
+    };
+    const token = proxy.registerDash(dash, { qn: dash.video.id });
+    const item = proxy.routes.get(token);
+    out.mpd = await localGet(`/mpd/${token}.mp4`);
+    const vPath = `/s/${item.videoToken}.mp4`;
+    out.first = await localGet(vPath, 'bytes=0-2047999');
+    out.healthy = Boolean(out.mpd && out.mpd.status === 200 && out.first && out.first.status === 206 && out.first.bytes > 100000);
+    return json(res, 200, out);
+  } catch (err) {
+    out.error = err.message;
+    return json(res, 200, out);
+  }
 }
 
 function json(res, code, body) {
@@ -194,6 +289,17 @@ async function handleMessage(conn, raw) {
 
       case 'status':
         return reply(conn, id, caster.snapshot());
+
+      // 扩展一连上就把登录 Cookie 推过来：桥接自己也能用它复测/预取，
+      // 不用每次投屏才拿一次（也让 /selftest 这类自检能跑起来）
+      case 'account': {
+        const c = String(payload.cookie || '');
+        if (c.length > 20 && c.includes('=')) {
+          cacheCookie(c);
+          log('info', `已同步登录凭证（${/SESSDATA=/.test(c) ? '含 SESSDATA' : 'Cookie'}）`);
+        }
+        return reply(conn, id, { saved: Boolean(c) });
+      }
 
       case 'scan': {
         if (scanning) return reply(conn, id, { devices: lastDevices, scanning: true });
@@ -275,12 +381,40 @@ async function handleMessage(conn, raw) {
         }
 
         log('info', '解析视频信息…');
-        const meta = await bili.resolveVideo({
-          bvid: input.bvid,
-          aid: input.aid,
-          epId: input.epId,
-          page: input.page,
-        });
+        let meta;
+        if (input.cid && (input.aid || input.bvid)) {
+          // 页面已经把 cid 带过来了就不再请求一次接口（view 接口容易被风控）
+          meta = {
+            aid: Number(input.aid) || 0,
+            bvid: String(input.bvid || ''),
+            cid: Number(input.cid),
+            epid: Number(input.epId) || 0,
+            seasonId: 0,
+            title: String(input.title || input.bvid || ''),
+            partTitle: '',
+            page: Number(input.page) || 1,
+            pageCount: 1,
+            duration: Number(input.duration) || 0,
+            kind: input.epId ? 'bangumi' : 'video',
+          };
+        } else {
+          // view 接口偶发「请求错误」（风控抖动），隔一秒重试一次
+          for (let i = 0; ; i++) {
+            try {
+              meta = await bili.resolveVideo({
+                bvid: input.bvid,
+                aid: input.aid,
+                epId: input.epId,
+                page: input.page,
+              });
+              break;
+            } catch (err) {
+              if (i >= 2) throw err;
+              log('warn', `解析视频信息失败（${err.message}），正在重试…`);
+              await new Promise((r) => setTimeout(r, 1200));
+            }
+          }
+        }
 
         const video = {
           ...meta,
@@ -507,16 +641,41 @@ function onListening() {
   console.log(`  版本      ${BUILD}`);
   console.log(`  本机地址  ${localAddresses().join('  ') || '(未检测到局域网地址)'}`);
   console.log(`  客户端 ID ${caster.clientUuid}`);
-  console.log(`  流转发    ${PROXY_PORT} 端口${proxy.running ? '（电视经此取流）' : '（未启动）'}`);
+  console.log(`  流转发    ${proxy.port} 端口${proxy.running ? '（电视经此取流）' : '（未启动）'}`);
   console.log('  协议      NVA / 哔哩必连（B 站私有投屏协议，TCP 9958）');
   console.log('');
   console.log('  保持本窗口运行，然后在 Chrome 里点扩展图标即可投屏。');
   console.log('');
 }
 
+/**
+ * 流转发端口也要抢一次。
+ * 常见情况：上一次的黑窗口还开着（或升级前的老进程没退），8787 被接管了，
+ * 但 8790 还攥在它手里 —— 新一轮就只能在 8791 上起，电视拿到的地址却还是老端口，
+ * 表现就是「清单拿到了但 0 网速」。这里直接把占用者清掉。
+ */
+async function ensureProxyPort() {
+  for (let i = 0; i < 6; i++) {
+    const p = PROXY_PORT + i;
+    if (!(await isPortInUse(p))) {
+      proxy.port = p;
+      return;
+    }
+    const pid = findPidOnPort(p);
+    if (pid && killNodePid(pid) && (await waitPortFree(p, 2500))) {
+      proxy.port = p;
+      log('info', `已结束占用 ${p} 端口的旧转发进程`);
+      return;
+    }
+  }
+  log('warn', `流转发端口 ${PROXY_PORT} 起连续 6 个都被占用，仍尝试用 ${PROXY_PORT}`);
+  proxy.port = PROXY_PORT;
+}
+
 (async () => {
   const free = await takeoverPort(PORT);
   if (!free) process.exit(1);
+  await ensureProxyPort();
   proxy.start();
   server.listen(PORT, HOST, onListening);
 })();

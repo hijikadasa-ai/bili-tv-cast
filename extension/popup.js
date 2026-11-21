@@ -633,21 +633,37 @@ function applyState(state) {
 
 let lastQualityKey = '';
 
-/** 用桥接回来的清晰度列表刷新下拉框 */
+/** 没拿到接口清单时用的完整梯队（8K / 杜比 / HDR / 4K 都要能选） */
+const QN_LADDER = [
+  [127, '8K'],
+  [126, '杜比视界'],
+  [125, '真彩 HDR'],
+  [120, '超清 4K'],
+  [116, '高清 1080P60'],
+  [112, '高码率 1080P+'],
+  [80, '高清 1080P'],
+  [74, '高清 720P60'],
+  [64, '高清 720P'],
+  [32, '清晰 480P'],
+  [16, '流畅 360P'],
+];
+
+/** 用桥接回来的清晰度列表刷新下拉框（列表为空时给完整梯队，别让 4K 消失） */
 function renderQualities(state) {
   const list = Array.isArray(state.qualities) ? state.qualities : [];
-  const key = list.map((q) => `${q.qn}:${q.label}`).join('|');
+  const items = list.length
+    ? list
+    : QN_LADDER.map(([qn, label]) => ({ qn, label }));
+  const key = items.map((q) => `${q.qn}:${q.label}`).join('|') + (list.length ? '|api' : '|all');
 
   if (key !== lastQualityKey) {
     lastQualityKey = key;
     els.qualitySelect.innerHTML = '';
-    if (!list.length) {
-      const opt = document.createElement('option');
-      opt.value = '0';
-      opt.textContent = '自动';
-      els.qualitySelect.append(opt);
-    }
-    for (const q of list) {
+    const auto = document.createElement('option');
+    auto.value = '0';
+    auto.textContent = '自动（登录后默认 1080P）';
+    els.qualitySelect.append(auto);
+    for (const q of items) {
       const opt = document.createElement('option');
       opt.value = String(q.qn);
       opt.textContent = q.label;
@@ -656,11 +672,12 @@ function renderQualities(state) {
   }
 
   const current = state.quality && state.quality.qn;
-  if (current) {
-    const v = String(current);
-    if (els.qualitySelect.value !== v) els.qualitySelect.value = v;
+  const wanted = current ? String(current) : String(prefs.qn || 0);
+  if (els.qualitySelect.value !== wanted && [...els.qualitySelect.options].some((o) => o.value === wanted)) {
+    els.qualitySelect.value = wanted;
   }
-  els.qualitySelect.disabled = !list.length || state.state !== 'casting';
+  // 没在投屏时也允许先选好清晰度（下次投屏生效）
+  els.qualitySelect.disabled = !bridgeReady;
 }
 
 /** 电视端自己开关弹幕时，把下拉框同步回来 */

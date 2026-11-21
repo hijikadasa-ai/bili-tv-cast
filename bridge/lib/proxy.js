@@ -32,6 +32,20 @@ const TTL_MS = 3 * 60 * 60 * 1000;
 const agentHttp = new http.Agent({ keepAlive: true, maxSockets: 48, keepAliveMsecs: 30000 });
 const agentHttps = new https.Agent({ keepAlive: true, maxSockets: 48, keepAliveMsecs: 30000 });
 
+/**
+ * 预读块大小。
+ *
+ * 电视播放器（Bilibili Freedoooooom/MarkII）不是「0- 开放式」拉流，
+ * 而是按 625KB 一小段一小段地顺序请求。B 站 CDN 对这种小 Range 请求很抠：
+ * 单个 625KB 往往要 1~3 秒才吐完（实测 0.2~0.5MB/s），电视于是永远缓冲不满，
+ * 屏幕上就一直显示「没速度」。
+ *
+ * 解决办法：电视要 625KB，我们向 CDN 一次要 4MB 存进内存，之后它再要相邻的块
+ * 就直接从内存回（局域网速度）。实测 4MB 的请求 CDN 给到 6~12MB/s。
+ */
+const BLOCK = 4 * 1024 * 1024;
+const MAX_CACHE_BYTES = 192 * 1024 * 1024;
+
 class StreamProxy {
   constructor(opts = {}) {
     this.port = Number(opts.port) || 8790;
@@ -52,6 +66,9 @@ class StreamProxy {
     this._lastActiveAt = 0;
     this._lastSpeedLogAt = 0;
     this._speedTimer = null;
+    this.cacheBytes = 0; // 预读缓存占用
+    this.cacheHits = 0;
+    this.upstreamSlow = 0; // 上游单块耗时超过 1.5s 的次数
   }
 
   /** 登记一个上游地址，返回可给电视使用的 token */
@@ -248,6 +265,14 @@ class StreamProxy {
 
   _handle(req, res) {
     const path = String(req.url || '').split('?')[0];
+    if (process.env.BILI_PROXY_TRACE === '1') {
+      this.onLog(
+        'info',
+        `请求 ${req.method} ${path.slice(0, 40)} range=${req.headers.range || '-'} ua=${String(
+          req.headers['user-agent'] || '-'
+        ).slice(0, 28)}`
+      );
+    }
 
     const mpd = /^\/mpd\/([a-f0-9]{16,64})\.(mpd|mp4)$/.exec(path);
     if (mpd) {
@@ -260,6 +285,12 @@ class StreamProxy {
       this.mpdHits++;
       this.lastClient = `${req.socket.remoteAddress || ''} ${req.headers['user-agent'] || ''}`.trim();
       this._note(`取清单 qn=${item.qn || '?'} ← ${req.socket.remoteAddress || '?'}`);
+      if (this.mpdHits === 1) {
+        this.onLog(
+          'info',
+          `电视来取清单了（qn=${item.qn || '?'}，${(req.headers['user-agent'] || '未知').slice(0, 60)}）`
+        );
+      }
       const missIdx = !(item.dash.video.indexRange && item.dash.audio.indexRange);
       if (missIdx) this.onLog('warn', '清单里缺分片索引（indexRange），电视可能一直 0 网速');
       const xml = this._buildMpd(item, req.headers.host || `127.0.0.1:${this.port}`);
@@ -318,14 +349,183 @@ class StreamProxy {
     this.lastRange = req.headers.range || '整段';
     if (!item._loggedFirstGet) {
       item._loggedFirstGet = true;
-      this.onLog('info', `电视开始取流（${item.kind || 'stream'}，${this.lastRange}）`);
+      const ua = String(req.headers['user-agent'] || '未知').slice(0, 60);
+      this.onLog('info', `电视开始取流（${item.kind || 'stream'}，${this.lastRange}，${ua}）`);
       this._note(`取流 ${item.kind || ''} ${this.lastRange} ← ${req.socket.remoteAddress || '?'}`);
     }
+    if (this._tryRangeServe(item, req, res)) return undefined;
     this._forward(item, req, res, 0, 0);
   }
 
-  /** 生成 MPD：SegmentBase + indexRange，播放器可以直接按字节区间拖动 */
-  _buildMpd(item, host) {
+  // ---------------------------------------------------------- 预读块缓存
+
+  /** 在缓存里找能覆盖 [s, e] 的块（e < 0 表示只要起点之后） */
+  _cacheSlice(item, s, e) {
+    if (!item.blocks || !item.blocks.length) return null;
+    for (const b of item.blocks) {
+      if (b.start > s) continue;
+      if (b.buf.length === 0) continue;
+      const end = b.start + b.buf.length - 1;
+      if (end < s) continue;
+      if (e >= 0 && end < e) continue;
+      return { buf: b.buf, start: b.start, end };
+    }
+    return null;
+  }
+
+  _cachePut(item, start, buf, total) {
+    if (!buf || !buf.length) return;
+    if (!item.blocks) item.blocks = [];
+    // 同一轨道最多留 8 块（约 32MB），防止用户长片拖进度条把内存吃满
+    while (item.blocks.length >= 8) {
+      const old = item.blocks.shift();
+      this.cacheBytes -= old.buf.length;
+    }
+    item.blocks.push({ start, buf });
+    this.cacheBytes += buf.length;
+    if (total) item.total = total;
+    if (item.blocks.length === 1) {
+      this.onLog('info', `预读 ${(buf.length / 1048576).toFixed(1)} MB（上游 ${item._lastHost || '?'}）`);
+    }
+    // 全局上限：超了就从最老的开始丢
+    while (this.cacheBytes > MAX_CACHE_BYTES) {
+      let victim = null;
+      for (const [, it] of this.routes) {
+        if (it.blocks && it.blocks.length && (!victim || it.blocks[0].start < victim.blocks[0].start)) victim = it;
+      }
+      if (!victim) break;
+      const old = victim.blocks.shift();
+      this.cacheBytes -= old.buf.length;
+    }
+  }
+
+  /** 向上游取一段字节（带多节点故障切换），返回 { buf, total } */
+  _fetchBlock(item, start, end) {
+    const list = (Array.isArray(item.urls) && item.urls.length ? item.urls : [item.url]).filter(Boolean);
+    const tryOne = (i) =>
+      new Promise((resolve, reject) => {
+        const target = list[i] || item.url;
+        let u;
+        try {
+          u = new URL(target);
+        } catch (_) {
+          return reject(new Error('bad url'));
+        }
+        const lib = u.protocol === 'https:' ? https : http;
+        const agent = u.protocol === 'https:' ? agentHttps : agentHttp;
+        const t0 = Date.now();
+        const req = lib.request(
+          {
+            hostname: u.hostname,
+            port: u.port || (u.protocol === 'https:' ? 443 : 80),
+            path: u.pathname + u.search,
+            method: 'GET',
+            agent,
+            headers: {
+              'User-Agent': UA,
+              Referer: REFERER,
+              Origin: ORIGIN,
+              Accept: '*/*',
+              'Accept-Encoding': 'identity',
+              Range: `bytes=${start}-${end}`,
+            },
+          },
+          (r) => {
+            const code = r.statusCode || 0;
+            if (code >= 300 && code < 400 && r.headers.location) {
+              r.resume();
+              const next = new URL(r.headers.location, target).toString();
+              list[i] = next;
+              return tryOne(i).then(resolve, reject);
+            }
+            if (code !== 200 && code !== 206) {
+              r.resume();
+              return reject(new Error(`HTTP ${code}`));
+            }
+            const total = Number(String(r.headers['content-range'] || '').split('/')[1]) || 0;
+            const chunks = [];
+            r.on('data', (c) => chunks.push(c));
+            r.on('end', () => {
+              const buf = Buffer.concat(chunks);
+              if (!buf.length) return reject(new Error('空响应'));
+              // 成功的节点提到首位，后面的块优先用它
+              if (i > 0) {
+                const h = list.splice(i, 1)[0];
+                list.unshift(h);
+              }
+              item._lastHost = u.hostname;
+              const cost = Date.now() - t0;
+              if (cost > 1500) this.upstreamSlow++;
+              resolve({ buf, total, cost });
+            });
+            r.on('error', reject);
+          }
+        );
+        req.setTimeout(25000, () => req.destroy(new Error('上游超时')));
+        req.on('error', reject);
+        req.end();
+      });
+
+    const run = (i) => tryOne(i).catch((err) => (i + 1 < list.length ? run(i + 1) : Promise.reject(err)));
+    return run(0);
+  }
+
+  /**
+   * 电视的 Range 请求优先走「整块预读 + 内存应答」。
+   * 返回 true 表示已经接管（异步完成），false 表示交回原来的直传逻辑。
+   */
+  _tryRangeServe(item, req, res) {
+    if (req.method !== 'GET') return false;
+    const m = /^bytes=(\d+)-(\d*)$/.exec(String(req.headers.range || '').trim());
+    if (!m) return false;
+    const s = Number(m[1]);
+    const wantEnd = m[2] ? Number(m[2]) : -1;
+
+    const hit = this._cacheSlice(item, s, wantEnd);
+    if (hit) {
+      this.cacheHits++;
+      const end = wantEnd >= 0 ? Math.min(wantEnd, hit.end) : hit.end;
+      const slice = hit.buf.slice(s - hit.start, end - hit.start + 1);
+      const total = item.total || end + 1;
+      res.writeHead(206, {
+        'Content-Type': item.kind === 'dash-audio' ? 'audio/mp4' : 'video/mp4',
+        'Accept-Ranges': 'bytes',
+        'Content-Range': `bytes ${s}-${end}/${total}`,
+        'Content-Length': slice.length,
+        'Cache-Control': 'no-store',
+      });
+      this.bytes += slice.length;
+      res.end(slice);
+      return true;
+    }
+
+    // 未命中：取一个 4MB 大块，再把电视要的那一小段回给它
+    const blockEnd = Math.max(s, s + BLOCK - 1);
+    this._fetchBlock(item, s, blockEnd)
+      .then(({ buf, total, cost }) => {
+        this._cachePut(item, s, buf, total);
+        const end = wantEnd >= 0 ? Math.min(wantEnd, s + buf.length - 1) : s + buf.length - 1;
+        const slice = buf.slice(0, end - s + 1);
+        const all = total || item.total || end + 1;
+        if (cost > 1500) this.onLog('warn', `上游这一块花了 ${(cost / 1000).toFixed(1)} 秒，可能节点限速`);
+        res.writeHead(206, {
+          'Content-Type': item.kind === 'dash-audio' ? 'audio/mp4' : 'video/mp4',
+          'Accept-Ranges': 'bytes',
+          'Content-Range': `bytes ${s}-${end}/${all}`,
+          'Content-Length': slice.length,
+          'Cache-Control': 'no-store',
+        });
+        this.bytes += slice.length;
+        res.end(slice);
+      })
+      .catch(() => {
+        // 预读取失败就退回直传，别让电视干等
+        this._forward(item, req, res, 0, 0);
+      });
+    return true;
+  }
+
+  /** 生成 MPD：SegmentBase + indexRange，播放器可以直接按字节区间拖动 */  _buildMpd(item, host) {
     const { video, audio, duration } = item.dash;
     // host 可能已经带端口（请求头里的 Host）
     const base = host.includes(':') ? `http://${host}` : `http://${host}:${this.port}`;

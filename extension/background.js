@@ -180,6 +180,9 @@ function handleBridge(msg) {
         conn.state = msg.state;
         broadcastState();
       }
+      // 连上就把登录凭证同步给桥接：这样它自己也能复测高清链路，
+      // 不用等到用户点投屏才拿到 Cookie
+      pushAccount();
       break;
     case 'state':
       conn.state = msg.data || null;
@@ -243,6 +246,22 @@ async function sessdata() {
     return pairs.join('; ');
   } catch (_) {
     return '';
+  }
+}
+
+/**
+ * 把登录 Cookie 主动同步给桥接（连上就发一次）。
+ * 桥接拿到后能自己诊断「这个号能看几 K」「取流节点快不快」，
+ * 我们排查问题时不用每次都等你点投屏。
+ */
+async function pushAccount() {
+  try {
+    const cookie = await sessdata();
+    if (!cookie) return;
+    if (!conn.ws || conn.ws.readyState !== WebSocket.OPEN) return;
+    conn.ws.send(JSON.stringify({ id: null, type: 'account', payload: { cookie } }));
+  } catch (_) {
+    /* 同步失败不影响投屏 */
   }
 }
 
